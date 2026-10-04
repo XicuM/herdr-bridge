@@ -1,0 +1,15 @@
+[Unit]
+Description=Herdr Mobile Companion Bridge Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=xicu
+WorkingDirectory=/home/xicu/herdr-mobile
+ExecStart=/home/xicu/herdr-mobile/deploy/start-bridge.sh
+Restart=always
+RestartSec=5
+Environment=RUST_LOG=herdr_bridge=info,tower_http=info
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Herdr Mobile</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css" />
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+    body, html { width: 100%; height: 100%; background: #000; color: #fff; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; overflow: hidden; }
+    
+    #app { display: flex; flex-direction: column; width: 100%; height: 100%; }
+    
+    /* Top Bar */
+    header {
+      height: 48px; background: #181818; display: flex; align-items: center; justify-content: space-between;
+      padding: 0 12px; border-bottom: 1px solid #2a2a2a; flex-shrink: 0;
+    }
+    .header-left { display: flex; align-items: center; gap: 10px; }
+    .menu-btn { background: none; border: none; color: #fff; font-size: 20px; cursor: pointer; padding: 6px; }
+    .pane-title { font-size: 14px; font-weight: bold; max-width: 180px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    
+    .status-badge {
+      display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border-radius: 12px;
+      font-size: 11px; font-weight: bold; text-transform: uppercase;
+    }
+    .status-working { background: rgba(76, 175, 80, 0.2); color: #4CAF50; border: 1px solid #4CAF50; }
+    .status-blocked { background: rgba(255, 152, 0, 0.2); color: #FF9800; border: 1px solid #FF9800; animation: pulse 1.5s infinite; }
+    .status-done { background: rgba(33, 150, 243, 0.2); color: #2196F3; border: 1px solid #2196F3; }
+    .status-idle { background: rgba(158, 158, 158, 0.2); color: #9E9E9E; border: 1px solid #9E9E9E; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+
+    /* Approval Banner */
+    #approval-banner {
+      display: none; background: #b71c1c; color: #fff; padding: 8px 12px;
+      font-size: 12px; font-weight: bold; align-items: center; justify-content: space-between; flex-shrink: 0;
+    }
+    .banner-actions { display: flex; gap: 8px; }
+    .banner-btn {
+      padding: 4px 10px; border-radius: 4px; border: none; font-weight: bold; font-size: 11px; cursor: pointer;
+    }
+    .btn-approve { background: #4caf50; color: #fff; }
+    .btn-reject { background: #f44336; color: #fff; }
+
+    /* Terminal Container */
+    #terminal-container { flex: 1; width: 100%; height: 100%; position: relative; overflow: hidden; background: #000; }
+    .xterm { height: 100%; padding: 4px; }
+
+    /* Keyboard Toolbar */
+    #keyboard-toolbar {
+      height: 44px; background: #1e1e1e; display: flex; overflow-x: auto;
+      padding: 4px 8px; gap: 6px; align-items: center; border-top: 1px solid #2a2a2a; flex-shrink: 0;
+      scrollbar-width: none;
+    }
+    #keyboard-toolbar::-webkit-scrollbar { display: none; }
+    .key-btn {
+      min-width: 44px; height: 34px; background: rgba(255, 255, 255, 0.1); border: none;
+      border-radius: 5px; color: #eee; font-size: 12px; font-weight: bold; display: flex;
+      align-items: center; justify-content: center; cursor: pointer; user-select: none; flex-shrink: 0;
+    }
+    .key-btn:active, .key-btn.active { background: #2196f3; color: #fff; }
+    .key-ctrl-c { background: rgba(244, 67, 54, 0.2); color: #f44336; }
+
+    /* Navigation Drawer */
+    #drawer-overlay {
+      display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      background: rgba(0,0,0,0.6); z-index: 100;
+    }
+    #drawer {
+      position: fixed; top: 0; left: -280px; width: 280px; height: 100%;
+      background: #181818; z-index: 101; transition: left 0.25s ease;
+      display: flex; flex-direction: column; border-right: 1px solid #2a2a2a;
+    }
+    #drawer.open { left: 0; }
+    .drawer-header {
+      padding: 16px; border-bottom: 1px solid #2a2a2a; font-size: 16px; font-weight: bold;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .drawer-list { flex: 1; overflow-y: auto; padding: 12px 0; }
+    .ws-group-title {
+      font-size: 11px; text-transform: uppercase; color: #888; padding: 8px 16px; font-weight: bold;
+    }
+    .pane-item {
+      padding: 10px 16px; display: flex; align-items: center; justify-content: space-between;
+      cursor: pointer; font-size: 13px; color: #ccc;
+    }
+    .pane-item:hover, .pane-item.active { background: rgba(33, 150, 243, 0.15); color: #fff; }
+  </style>
+</head>
+<body>
+  <div id="drawer-overlay" onclick="toggleDrawer()"></div>
+  <div id="drawer">
+    <div class="drawer-header">
+      <span>Herdr Workspaces</span>
+      <span id="conn-indicator" style="width: 8px; height: 8px; border-radius: 50%; background: #4caf50;"></span>
+    </div>
+    <div class="drawer-list" id="drawer-list"></div>
+  </div>
+
+  <div id="app">
+    <header>
+      <div class="header-left">
+        <button class="menu-btn" onclick="toggleDrawer()">☰</button>
+        <div class="pane-title" id="header-title">Herdr Mobile</div>
+      </div>
+      <div id="header-badge" class="status-badge status-idle">Ready</div>
+    </header>
+
+    <div id="approval-banner">
+      <span>Agent waiting for your input!</span>
+      <div class="banner-actions">
+        <button class="banner-btn btn-approve" onclick="sendInput('y\n')">Approve (y)</button>
+        <button class="banner-btn btn-reject" onclick="sendInput('n\n')">Reject (n)</button>
+      </div>
+    </div>
+
+    <div id="terminal-container"></div>
+
+    <div id="keyboard-toolbar">
+      <button class="key-btn" onclick="sendInput('\x1b')">ESC</button>
+      <button class="key-btn" onclick="sendInput('\t')">TAB</button>
+      <button class="key-btn" id="ctrl-btn" onclick="toggleCtrl()">CTRL</button>
+      <button class="key-btn" onclick="sendInput('\x1b[A')">↑</button>
+      <button class="key-btn" onclick="sendInput('\x1b[B')">↓</button>
+      <button class="key-btn" onclick="sendInput('\x1b[D')">←</button>
+      <button class="key-btn" onclick="sendInput('\x1b[C')">→</button>
+      <button class="key-btn key-ctrl-c" onclick="sendInput('\x03')">^C</button>
+      <button class="key-btn" onclick="sendInput('\r')">RET</button>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.8.0/lib/addon-fit.min.js"></script>
+  <script>
+    let term, fitAddon, paneWs, sessionWs;
+    let currentPaneId = null;
+    let ctrlActive = false;
+    let sessionData = null;
+
+    function initTerminal() {
+      term = new Terminal({
+        cursorBlink: true,
+        fontSize: 13,
+        fontFamily: 'monospace',
+        theme: { background: '#000000', foreground: '#ffffff' }
+      });
+      fitAddon = new FitAddon.FitAddon();
+      term.loadAddon(fitAddon);
+      term.open(document.getElementById('terminal-container'));
+      fitAddon.fit();
+
+      window.addEventListener('resize', () => {
+        fitAddon.fit();
+        if (paneWs && paneWs.readyState === WebSocket.OPEN && currentPaneId) {
+          paneWs.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+        }
+      });
+
+      term.onData(data => {
+        sendInput(data);
+      });
+    }
+
+    function toggleCtrl() {
+      ctrlActive = !ctrlActive;
+      document.getElementById('ctrl-btn').classList.toggle('active', ctrlActive);
+    }
+
+    function sendInput(data) {
+      if (!paneWs || paneWs.readyState !== WebSocket.OPEN) return;
+      if (ctrlActive && data.length === 1) {
+        let code = data.toUpperCase().charCodeAt(0) - 64;
+        if (code >= 1 && code <= 26) {
+          paneWs.send(String.fromCharCode(code));
+        } else {
+          paneWs.send(data);
+        }
+        toggleCtrl();
+      } else {
+        paneWs.send(data);
+      }
+    }
+
+    function connectPane(paneId) {
+      if (currentPaneId === paneId && paneWs) return;
+      currentPaneId = paneId;
+      if (paneWs) paneWs.close();
+      term.reset();
+
+      const host = window.location.host;
+      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      paneWs = new WebSocket(`${proto}//${host}/ws/pane/${paneId}`);
+
+      paneWs.onopen = () => {
+        paneWs.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+      };
+      paneWs.onmessage = (ev) => {
+        term.write(ev.data);
+      };
+
+      updateHeader();
+    }
+
+    function connectSession() {
+      const host = window.location.host;
+      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      sessionWs = new WebSocket(`${proto}//${host}/ws/session`);
+
+      sessionWs.onopen = () => {
+        document.getElementById('conn-indicator').style.background = '#4caf50';
+      };
+      sessionWs.onclose = () => {
+        document.getElementById('conn-indicator').style.background = '#f44336';
+        setTimeout(connectSession, 3000);
+      };
+      sessionWs.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data);
+          if (msg.type === 'snapshot' && msg.data) {
+            sessionData = msg.data.snapshot || msg.data;
+            renderDrawer();
+            if (!currentPaneId && sessionData.panes && sessionData.panes.length > 0) {
+              const focused = sessionData.focused_pane_id || sessionData.panes[0].pane_id;
+              connectPane(focused);
+            }
+            updateHeader();
+          } else if (msg.type === 'event') {
+            fetch('/api/snapshot').then(r => r.json()).then(data => {
+              sessionData = data.snapshot || data;
+              renderDrawer();
+              updateHeader();
+            });
+          }
+        } catch (_) {}
+      };
+    }
+
+    function renderDrawer() {
+      if (!sessionData) return;
+      const list = document.getElementById('drawer-list');
+      list.innerHTML = '';
+
+      (sessionData.workspaces || []).forEach(ws => {
+        const title = document.createElement('div');
+        title.className = 'ws-group-title';
+        title.innerText = ws.label ? `${ws.label} (${ws.workspace_id})` : ws.workspace_id;
+        list.appendChild(title);
+
+        const panes = (sessionData.panes || []).filter(p => p.workspace_id === ws.workspace_id);
+        panes.forEach(pane => {
+          const item = document.createElement('div');
+          item.className = 'pane-item' + (pane.pane_id === currentPaneId ? ' active' : '');
+          const agent = (sessionData.agents || []).find(a => a.pane_id === pane.pane_id);
+          const status = agent ? agent.status : pane.agent_status;
+          
+          item.innerHTML = `
+            <span>${pane.terminal_title || pane.pane_id}</span>
+            <span class="status-badge status-${status}">${status}</span>
+          `;
+          item.onclick = () => {
+            connectPane(pane.pane_id);
+            toggleDrawer();
+          };
+          list.appendChild(item);
+        });
+      });
+    }
+
+    function updateHeader() {
+      if (!sessionData || !currentPaneId) return;
+      const pane = (sessionData.panes || []).find(p => p.pane_id === currentPaneId);
+      const agent = (sessionData.agents || []).find(a => a.pane_id === currentPaneId);
+      const status = agent ? agent.status : (pane ? pane.agent_status : 'unknown');
+
+      document.getElementById('header-title').innerText = pane ? (pane.terminal_title || pane.pane_id) : currentPaneId;
+      
+      const badge = document.getElementById('header-badge');
+      badge.className = `status-badge status-${status}`;
+      badge.innerText = agent ? `${agent.name || 'agent'} · ${status}` : status;
+
+      const banner = document.getElementById('approval-banner');
+      banner.style.display = status === 'blocked' ? 'flex' : 'none';
+    }
+
+    function toggleDrawer() {
+      const drawer = document.getElementById('drawer');
+      const overlay = document.getElementById('drawer-overlay');
+      const isOpen = drawer.classList.contains('open');
+      drawer.classList.toggle('open', !isOpen);
+      overlay.style.display = isOpen ? 'none' : 'block';
+    }
+
+    window.onload = () => {
+      initTerminal();
+      connectSession();
+    };
+  </script>
+</body>
+</html>
