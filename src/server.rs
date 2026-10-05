@@ -114,38 +114,36 @@ async fn ws_session_handler(
 async fn handle_ws_session(socket: WebSocket, state: AppState) {
     let (mut sender, mut receiver) = socket.split();
     let mut event_rx = state.herdr.subscribe();
-
-    // Send initial snapshot upon connection
-    if let Ok(snapshot) = state.herdr.snapshot().await {
-        let msg = json!({
-            "type": "snapshot",
-            "data": snapshot
-        });
-        if let Ok(text) = serde_json::to_string(&msg) {
-            let _ = sender.send(Message::Text(text.into())).await;
-        }
-    }
+    let herdr = state.herdr.clone();
 
     let mut send_task = tokio::spawn(async move {
+        // Herdr's global event subscription carries no agent status changes, so the snapshot is also
+        // polled and pushed whenever it changed: that is how the app sees agents start waiting or
+        // finish (and raises its alerts). The first tick sends the initial snapshot.
+        let mut last = String::new();
+        let mut tick = tokio::time::interval(Duration::from_millis(1500));
         loop {
-            match event_rx.recv().await {
-                Ok(event) => {
-                    let msg = json!({
-                        "type": "event",
-                        "data": event
-                    });
-                    if let Ok(text) = serde_json::to_string(&msg) {
-                        if sender.send(Message::Text(text.into())).await.is_err() {
-                            break;
-                        }
+            let text = tokio::select! {
+                _ = tick.tick() => {
+                    let Ok(snapshot) = herdr.snapshot().await else { continue };
+                    let text = json!({ "type": "snapshot", "data": snapshot }).to_string();
+                    if text == last {
+                        continue;
                     }
+                    last = text.clone();
+                    text
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    warn!("Session WS client lagged by {} events", n);
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    break;
-                }
+                event = event_rx.recv() => match event {
+                    Ok(event) => json!({ "type": "event", "data": event }).to_string(),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("Session WS client lagged by {} events", n);
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
+            };
+            if sender.send(Message::Text(text.into())).await.is_err() {
+                break;
             }
         }
     });

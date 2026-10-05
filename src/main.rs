@@ -1,10 +1,8 @@
 mod herdr;
-mod notifier;
 mod server;
 
 use clap::Parser;
 use herdr::HerdrClient;
-use notifier::Notifier;
 use server::{create_router, AppState};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -26,18 +24,6 @@ struct Args {
     /// Port to listen on
     #[arg(short, long, env = "HERDR_BRIDGE_PORT", default_value_t = 7788)]
     port: u16,
-
-    /// Optional ntfy.sh topic name for push notifications (e.g. "my-herdr-agents")
-    #[arg(long, env = "NTFY_TOPIC")]
-    ntfy_topic: Option<String>,
-
-    /// Optional Pushover user key
-    #[arg(long, env = "PUSHOVER_USER")]
-    pushover_user: Option<String>,
-
-    /// Optional Pushover application token
-    #[arg(long, env = "PUSHOVER_TOKEN")]
-    pushover_token: Option<String>,
 }
 
 fn default_socket_path() -> PathBuf {
@@ -69,14 +55,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start background event listener
     herdr.clone().start_event_listener();
-
-    // Start push notifier
-    let notifier = Arc::new(Notifier::new(
-        args.ntfy_topic,
-        args.pushover_user,
-        args.pushover_token,
-    ));
-    notifier.start(herdr.clone(), herdr.subscribe());
 
     let state = AppState {
         herdr: herdr.clone(),

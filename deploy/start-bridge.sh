@@ -23,9 +23,6 @@ echo "=================================================="
 echo " Starting Herdr Mobile Bridge Daemon"
 echo " Bind Address: http://${BIND_ADDR}:${PORT}"
 echo " Herdr Socket: ${HERDR_SOCKET:-$HOME/.config/herdr/herdr.sock}"
-if [[ -n "${NTFY_TOPIC:-}" ]]; then
-  echo " Push Alerts:  ntfy.sh/${NTFY_TOPIC}"
-fi
 echo "=================================================="
 
 exec "$BINARY" --bind "$BIND_ADDR" --port "$PORT" "$@"
