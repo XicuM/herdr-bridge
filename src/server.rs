@@ -216,8 +216,13 @@ async fn handle_ws_term(socket: WebSocket, pane_id: String, size: TermSize) -> s
             msg = receiver.next() => {
                 let cmd = match msg {
                     Some(Ok(Message::Binary(bytes))) => json!({ "type": "terminal.input", "bytes": BASE64.encode(&bytes) }),
-                    Some(Ok(Message::Text(text))) => match serde_json::from_str::<TermSize>(&text) {
-                        Ok(s) => json!({ "type": "terminal.resize", "cols": s.cols, "rows": s.rows }),
+                    Some(Ok(Message::Text(text))) => match serde_json::from_str::<Value>(&text) {
+                        // Typed control commands (e.g. `terminal.scroll`) go to herdr as-is.
+                        Ok(cmd) if cmd.get("type").is_some() => cmd,
+                        Ok(v) => match serde_json::from_value::<TermSize>(v) {
+                            Ok(s) => json!({ "type": "terminal.resize", "cols": s.cols, "rows": s.rows }),
+                            Err(_) => continue,
+                        },
                         Err(_) => continue,
                     },
                     Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
