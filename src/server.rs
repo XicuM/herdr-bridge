@@ -5,7 +5,7 @@ use axum::{
         Path, Query, State,
     },
     http::StatusCode,
-    response::{Html, IntoResponse, Json},
+    response::{IntoResponse, Json},
     routing::{get, post},
     Router,
 };
@@ -22,8 +22,6 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::warn;
 
-const INDEX_HTML: &str = include_str!("index.html");
-
 #[derive(Clone)]
 pub struct AppState {
     pub herdr: Arc<HerdrClient>,
@@ -36,8 +34,6 @@ pub fn create_router(state: AppState) -> Router {
         .allow_headers(Any);
 
     Router::new()
-        .route("/", get(index_handler))
-        .route("/app", get(index_handler))
         .route("/health", get(health_check))
         .route("/api/snapshot", get(get_snapshot))
         .route("/api/pane/{id}/input", post(post_pane_input))
@@ -48,10 +44,6 @@ pub fn create_router(state: AppState) -> Router {
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
-}
-
-async fn index_handler() -> Html<&'static str> {
-    Html(INDEX_HTML)
 }
 
 async fn health_check() -> Json<Value> {
