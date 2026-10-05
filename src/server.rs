@@ -6,7 +6,7 @@ use axum::{
     },
     http::StatusCode,
     response::{IntoResponse, Json},
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -39,6 +39,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/pane/{id}/input", post(post_pane_input))
         .route("/api/tab", post(post_tab_create))
         .route("/api/workspace", post(post_workspace_create))
+        .route("/api/workspace/{id}", delete(delete_workspace))
+        .route("/api/workspace/{id}/rename", post(post_workspace_rename))
+        .route("/api/worktree", get(get_worktree_list).post(post_worktree_create))
+        .route("/api/worktree/open", post(post_worktree_open))
         .route("/ws/session", get(ws_session_handler))
         .route("/ws/term/{id}", get(ws_term_handler))
         .layer(cors)
@@ -99,6 +103,91 @@ async fn post_workspace_create(
     Json(params): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     match state.herdr.call("workspace.create", params).await {
+        Ok(res) => Ok(Json(res)),
+        Err(e) => Err((StatusCode::BAD_REQUEST, e)),
+    }
+}
+
+#[derive(Deserialize)]
+struct WorkspaceDeleteQuery {
+    remove_worktree: Option<bool>,
+    force: Option<bool>,
+}
+
+async fn delete_workspace(
+    State(state): State<AppState>,
+    Path(workspace_id): Path<String>,
+    Query(query): Query<WorkspaceDeleteQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let method = if query.remove_worktree.unwrap_or(false) {
+        "worktree.remove"
+    } else {
+        "workspace.close"
+    };
+    let mut params = json!({ "workspace_id": workspace_id });
+    if let Some(force) = query.force {
+        params["force"] = json!(force);
+    }
+    match state.herdr.call(method, params).await {
+        Ok(res) => Ok(Json(res)),
+        Err(e) => Err((StatusCode::BAD_REQUEST, e)),
+    }
+}
+
+#[derive(Deserialize)]
+struct WorkspaceRenameBody {
+    label: String,
+}
+
+async fn post_workspace_rename(
+    State(state): State<AppState>,
+    Path(workspace_id): Path<String>,
+    Json(body): Json<WorkspaceRenameBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let params = json!({
+        "workspace_id": workspace_id,
+        "label": body.label,
+    });
+    match state.herdr.call("workspace.rename", params).await {
+        Ok(res) => Ok(Json(res)),
+        Err(e) => Err((StatusCode::BAD_REQUEST, e)),
+    }
+}
+
+#[derive(Deserialize)]
+struct WorktreeListQuery {
+    workspace_id: Option<String>,
+}
+
+async fn get_worktree_list(
+    State(state): State<AppState>,
+    Query(query): Query<WorktreeListQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let mut params = json!({});
+    if let Some(ws_id) = query.workspace_id {
+        params["workspace_id"] = json!(ws_id);
+    }
+    match state.herdr.call("worktree.list", params).await {
+        Ok(res) => Ok(Json(res)),
+        Err(e) => Err((StatusCode::BAD_REQUEST, e)),
+    }
+}
+
+async fn post_worktree_create(
+    State(state): State<AppState>,
+    Json(params): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    match state.herdr.call("worktree.create", params).await {
+        Ok(res) => Ok(Json(res)),
+        Err(e) => Err((StatusCode::BAD_REQUEST, e)),
+    }
+}
+
+async fn post_worktree_open(
+    State(state): State<AppState>,
+    Json(params): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    match state.herdr.call("worktree.open", params).await {
         Ok(res) => Ok(Json(res)),
         Err(e) => Err((StatusCode::BAD_REQUEST, e)),
     }
