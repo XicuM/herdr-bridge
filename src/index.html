@@ -151,7 +151,7 @@
 
       window.addEventListener('resize', () => {
         fitAddon.fit();
-        if (paneWs && paneWs.readyState === WebSocket.OPEN && currentPaneId) {
+        if (paneWs && paneWs.readyState === WebSocket.OPEN) {
           paneWs.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
         }
       });
@@ -171,33 +171,29 @@
       if (ctrlActive && data.length === 1) {
         let code = data.toUpperCase().charCodeAt(0) - 64;
         if (code >= 1 && code <= 26) {
-          paneWs.send(String.fromCharCode(code));
+          paneWs.send(encoder.encode(String.fromCharCode(code)));
         } else {
-          paneWs.send(data);
+          paneWs.send(encoder.encode(data));
         }
         toggleCtrl();
       } else {
-        paneWs.send(data);
+        paneWs.send(encoder.encode(data));
       }
     }
 
+    // One herdr pane, sized to this terminal, streamed as raw terminal bytes.
+    const encoder = new TextEncoder();
     function connectPane(paneId) {
       if (currentPaneId === paneId && paneWs) return;
       currentPaneId = paneId;
-      if (paneWs) paneWs.close();
+      if (paneWs) { paneWs.onclose = null; paneWs.close(); }
       term.reset();
-
       const host = window.location.host;
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      paneWs = new WebSocket(`${proto}//${host}/ws/pane/${paneId}`);
-
-      paneWs.onopen = () => {
-        paneWs.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
-      };
-      paneWs.onmessage = (ev) => {
-        term.write(ev.data);
-      };
-
+      paneWs = new WebSocket(`${proto}//${host}/ws/term/${encodeURIComponent(paneId)}?cols=${term.cols}&rows=${term.rows}`);
+      paneWs.binaryType = 'arraybuffer';
+      paneWs.onmessage = (ev) => term.write(new Uint8Array(ev.data));
+      paneWs.onclose = () => setTimeout(() => { paneWs = null; connectPane(paneId); }, 2000);
       updateHeader();
     }
 
@@ -220,8 +216,7 @@
             sessionData = msg.data.snapshot || msg.data;
             renderDrawer();
             if (!currentPaneId && sessionData.panes && sessionData.panes.length > 0) {
-              const focused = sessionData.focused_pane_id || sessionData.panes[0].pane_id;
-              connectPane(focused);
+              connectPane(sessionData.focused_pane_id || sessionData.panes[0].pane_id);
             }
             updateHeader();
           } else if (msg.type === 'event') {

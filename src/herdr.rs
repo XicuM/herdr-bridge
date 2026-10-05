@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tokio::process::Command;
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
@@ -62,25 +63,43 @@ impl HerdrClient {
         Ok(res.get("result").cloned().unwrap_or(Value::Null))
     }
 
+    /// `session.snapshot`, with a `git_branch` added to each workspace (Herdr's API doesn't expose it).
     pub async fn snapshot(&self) -> Result<Value, String> {
-        self.call("session.snapshot", json!({})).await
-    }
+        let mut res = self.call("session.snapshot", json!({})).await?;
+        let snap = if res.get("snapshot").is_some() { &mut res["snapshot"] } else { &mut res };
+        let panes = snap["panes"].as_array().cloned().unwrap_or_default();
+        let Some(workspaces) = snap["workspaces"].as_array_mut() else { return Ok(res) };
 
-    pub async fn read_pane(&self, pane_id: &str, lines: Option<u32>) -> Result<String, String> {
-        let params = json!({
-            "pane_id": pane_id,
-            "source": "visible",
-            "format": "ansi",
-            "strip_ansi": false,
-            "lines": lines,
-        });
+        // A workspace's directory: its worktree checkout, else the focused pane of its active tab.
+        let dirs: Vec<Option<String>> = workspaces
+            .iter()
+            .map(|ws| {
+                if let Some(path) = ws["worktree"]["checkout_path"].as_str() {
+                    return Some(path.to_string());
+                }
+                let tab_panes: Vec<&Value> = panes.iter().filter(|p| p["tab_id"] == ws["active_tab_id"]).collect();
+                let pane = tab_panes.iter().find(|p| p["focused"] == true).or(tab_panes.first())?;
+                pane["foreground_cwd"].as_str().or(pane["cwd"].as_str()).map(String::from)
+            })
+            .collect();
 
-        let res = self.call("pane.read", params).await?;
-        if let Some(text) = res.pointer("/read/text").and_then(|v| v.as_str()) {
-            Ok(text.to_string())
-        } else {
-            Ok(String::new())
+        let branches = futures_util::future::join_all(dirs.into_iter().map(|dir| async move {
+            let out = Command::new("git")
+                .args(["-C", dir.as_deref()?, "branch", "--show-current"])
+                .output()
+                .await
+                .ok()?;
+            let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            (out.status.success() && !branch.is_empty()).then_some(branch)
+        }))
+        .await;
+
+        for (ws, branch) in workspaces.iter_mut().zip(branches) {
+            if let Some(branch) = branch {
+                ws["git_branch"] = Value::String(branch);
+            }
         }
+        Ok(res)
     }
 
     pub async fn send_input(&self, pane_id: &str, text: Option<&str>, keys: Option<Vec<String>>) -> Result<Value, String> {
@@ -94,15 +113,6 @@ impl HerdrClient {
             params["keys"] = json!(k);
         }
         self.call("pane.send_input", params).await
-    }
-
-    pub async fn resize_pane(&self, pane_id: &str, cols: u32, rows: u32) -> Result<Value, String> {
-        let params = json!({
-            "pane_id": pane_id,
-            "cols": cols,
-            "rows": rows
-        });
-        self.call("pane.resize", params).await
     }
 
     pub fn start_event_listener(self: Arc<Self>) {

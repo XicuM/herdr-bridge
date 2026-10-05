@@ -2,7 +2,7 @@ use crate::herdr::HerdrClient;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, State,
+        Path, Query, State,
     },
     http::StatusCode,
     response::{Html, IntoResponse, Json},
@@ -12,8 +12,12 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::warn;
@@ -37,9 +41,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/health", get(health_check))
         .route("/api/snapshot", get(get_snapshot))
         .route("/api/pane/{id}/input", post(post_pane_input))
-        .route("/api/pane/{id}/resize", post(post_pane_resize))
+        .route("/api/tab", post(post_tab_create))
+        .route("/api/workspace", post(post_workspace_create))
         .route("/ws/session", get(ws_session_handler))
-        .route("/ws/pane/{id}", get(ws_pane_handler))
+        .route("/ws/term/{id}", get(ws_term_handler))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -85,18 +90,23 @@ async fn post_pane_input(
     }
 }
 
-#[derive(Deserialize)]
-struct PaneResizeBody {
-    cols: u32,
-    rows: u32,
+/// Body is passed straight through as `tab.create` params (`workspace_id`, `label`, `cwd`, `focus`).
+async fn post_tab_create(
+    State(state): State<AppState>,
+    Json(params): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    match state.herdr.call("tab.create", params).await {
+        Ok(res) => Ok(Json(res)),
+        Err(e) => Err((StatusCode::BAD_REQUEST, e)),
+    }
 }
 
-async fn post_pane_resize(
+/// Body is passed straight through as `workspace.create` params (`label`, `cwd`, `focus`).
+async fn post_workspace_create(
     State(state): State<AppState>,
-    Path(pane_id): Path<String>,
-    Json(body): Json<PaneResizeBody>,
+    Json(params): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    match state.herdr.resize_pane(&pane_id, body.cols, body.rows).await {
+    match state.herdr.call("workspace.create", params).await {
         Ok(res) => Ok(Json(res)),
         Err(e) => Err((StatusCode::BAD_REQUEST, e)),
     }
@@ -164,110 +174,73 @@ async fn handle_ws_session(socket: WebSocket, state: AppState) {
     }
 }
 
-async fn ws_pane_handler(
-    ws: WebSocketUpgrade,
-    Path(pane_id): Path<String>,
-    State(state): State<AppState>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws_pane(socket, pane_id, state))
+#[derive(Deserialize)]
+struct TermSize {
+    cols: u16,
+    rows: u16,
 }
 
-async fn handle_ws_pane(socket: WebSocket, pane_id: String, state: AppState) {
+async fn ws_term_handler(
+    ws: WebSocketUpgrade,
+    Path(pane_id): Path<String>,
+    Query(size): Query<TermSize>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| async move {
+        if let Err(e) = handle_ws_term(socket, pane_id, size).await {
+            warn!("Terminal session ended with error: {}", e);
+        }
+    })
+}
+
+/// Streams one pane through `herdr terminal session control`, which sizes the pane to the viewer
+/// and emits server-rendered ANSI frames. Binary frames carry terminal output/input; text frames
+/// carry `{"cols","rows"}` resizes.
+async fn handle_ws_term(socket: WebSocket, pane_id: String, size: TermSize) -> std::io::Result<()> {
+    let mut child = Command::new("herdr")
+        .args(["terminal", "session", "control", &pane_id, "--takeover"])
+        .args(["--cols", &size.cols.to_string(), "--rows", &size.rows.to_string()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let mut frames = BufReader::new(child.stdout.take().expect("piped stdout")).lines();
+
     let (mut sender, mut receiver) = socket.split();
-    let herdr = state.herdr.clone();
-    let target_pane = pane_id.clone();
-
-    // Send initial visible screen content
-    if let Ok(content) = herdr.read_pane(&target_pane, None).await {
-        let _ = sender.send(Message::Text(content.into())).await;
-    }
-
-    // Stream updates to the client
-    let target_pane_for_send = target_pane.clone();
-    let herdr_for_send = herdr.clone();
-    let mut event_rx = herdr.subscribe();
-
-    let mut send_task = tokio::spawn(async move {
-        let mut last_content = String::new();
-        let mut interval = tokio::time::interval(Duration::from_millis(150));
-
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    if let Ok(content) = herdr_for_send.read_pane(&target_pane_for_send, None).await {
-                        if content != last_content && !content.is_empty() {
-                            last_content = content.clone();
-                            if sender.send(Message::Text(content.into())).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
+    loop {
+        tokio::select! {
+            line = frames.next_line() => {
+                let Some(line) = line? else { break };
+                let Ok(frame) = serde_json::from_str::<Value>(&line) else { continue };
+                if frame["type"] == "terminal.closed" {
+                    break;
                 }
-                Ok(event) = event_rx.recv() => {
-                    let ev_pane = event.pointer("/event/pane_id")
-                        .or_else(|| event.get("pane_id"))
-                        .and_then(|v| v.as_str());
-                    if ev_pane == Some(&target_pane_for_send) {
-                        if let Ok(content) = herdr_for_send.read_pane(&target_pane_for_send, None).await {
-                            if content != last_content && !content.is_empty() {
-                                last_content = content.clone();
-                                if sender.send(Message::Text(content.into())).await.is_err() {
-                                    break;
-                                }
-                            }
-                        }
+                if let Some(bytes) = frame["bytes"].as_str().and_then(|b| BASE64.decode(b).ok()) {
+                    if sender.send(Message::Binary(bytes.into())).await.is_err() {
+                        break;
                     }
                 }
             }
-        }
-    });
-
-    let target_pane_for_recv = target_pane.clone();
-    let herdr_for_recv = herdr.clone();
-
-    let mut recv_task = tokio::spawn(async move {
-        while let Some(Ok(msg)) = receiver.next().await {
-            match msg {
-                Message::Text(text) => {
-                    // Try parsing as control JSON or treat as raw input
-                    if let Ok(val) = serde_json::from_str::<Value>(&text) {
-                        let action = val.get("type").and_then(|v| v.as_str());
-                        match action {
-                            Some("input") => {
-                                let input_text = val.get("text").and_then(|v| v.as_str());
-                                let keys = val.get("keys").and_then(|v| v.as_array()).map(|arr| {
-                                    arr.iter().filter_map(|s| s.as_str().map(String::from)).collect()
-                                });
-                                let _ = herdr_for_recv.send_input(&target_pane_for_recv, input_text, keys).await;
-                            }
-                            Some("resize") => {
-                                let cols = val.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u32;
-                                let rows = val.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u32;
-                                let _ = herdr_for_recv.resize_pane(&target_pane_for_recv, cols, rows).await;
-                            }
-                            _ => {
-                                // Raw string input
-                                let _ = herdr_for_recv.send_input(&target_pane_for_recv, Some(&text), None).await;
-                            }
-                        }
-                    } else {
-                        // Raw text input sent from terminal
-                        let _ = herdr_for_recv.send_input(&target_pane_for_recv, Some(&text), None).await;
-                    }
-                }
-                Message::Binary(bin) => {
-                    if let Ok(text) = String::from_utf8(bin.to_vec()) {
-                        let _ = herdr_for_recv.send_input(&target_pane_for_recv, Some(&text), None).await;
-                    }
-                }
-                Message::Close(_) => break,
-                _ => {}
+            msg = receiver.next() => {
+                let cmd = match msg {
+                    Some(Ok(Message::Binary(bytes))) => json!({ "type": "terminal.input", "bytes": BASE64.encode(&bytes) }),
+                    Some(Ok(Message::Text(text))) => match serde_json::from_str::<TermSize>(&text) {
+                        Ok(s) => json!({ "type": "terminal.resize", "cols": s.cols, "rows": s.rows }),
+                        Err(_) => continue,
+                    },
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                    _ => continue,
+                };
+                stdin.write_all(format!("{cmd}\n").as_bytes()).await?;
             }
         }
-    });
-
-    tokio::select! {
-        _ = (&mut send_task) => recv_task.abort(),
-        _ = (&mut recv_task) => send_task.abort(),
     }
+
+    // Hand the pane's size back to the desktop layout.
+    let _ = stdin.write_all(b"{\"type\":\"terminal.release\"}\n").await;
+    drop(stdin);
+    if tokio::time::timeout(Duration::from_secs(2), child.wait()).await.is_err() {
+        child.kill().await?;
+    }
+    Ok(())
 }
