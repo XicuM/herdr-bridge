@@ -33,6 +33,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/health", get(health_check))
         .route("/api/snapshot", get(get_snapshot))
         .route("/api/tab", post(post_tab_create))
+        .route("/api/tab/move", post(post_tab_move))
         .route("/api/tab/{id}", delete(delete_tab))
         .route("/api/tab/{id}/rename", post(post_tab_rename))
         .route("/api/pane/{id}", delete(delete_pane))
@@ -104,6 +105,12 @@ async fn post_workspace_create(State(state): State<AppState>, Json(params): Json
 /// `before_workspace_id`, null for the end).
 async fn post_workspace_move(State(state): State<AppState>, Json(params): Json<Value>) -> ApiResult {
     rpc(&state, "workspace.move_block", params).await
+}
+
+/// Body is passed straight through as `tab.move` params (`tab_id`, `insert_index`: the tab goes in
+/// front of the one at that index in its workspace's order before the move).
+async fn post_tab_move(State(state): State<AppState>, Json(params): Json<Value>) -> ApiResult {
+    rpc(&state, "tab.move", params).await
 }
 
 #[derive(Deserialize)]
