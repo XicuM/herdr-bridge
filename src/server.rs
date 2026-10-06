@@ -2,7 +2,7 @@ use crate::herdr::HerdrClient;
 use axum::{
     extract::{
         ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
-        Path, Query, Request, State,
+        Extension, Path, Query, Request, State,
     },
     http::{header, StatusCode},
     middleware::{self, Next},
@@ -14,6 +14,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -21,10 +22,11 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
-use tokio::sync::watch;
+use tokio::sync::{watch, Mutex};
 use tower_http::trace::TraceLayer;
 use tracing::warn;
 
+/// One machine's herdr, as the routes below see it.
 #[derive(Clone)]
 pub struct AppState {
     pub herdr: Arc<HerdrClient>,
@@ -32,9 +34,27 @@ pub struct AppState {
     pub snapshots: Arc<watch::Sender<Utf8Bytes>>,
 }
 
-pub fn create_router(state: AppState) -> Router {
+/// Every machine the bridge serves: its own, at `/`, and each one saved in herdr (`herdr machine list`)
+/// at `/m/<id>/`, reached over SSH and set up on its first request.
+#[derive(Clone)]
+struct Machines {
+    local: AppState,
+    remote: Arc<Mutex<HashMap<String, AppState>>>,
+}
+
+pub fn create_router(local: AppState) -> Router {
+    let machines = Machines { local, remote: Default::default() };
+    // The routes see one machine's [AppState]; the machine is picked, and its `/m/<id>` prefix cut,
+    // before they route.
+    Router::new()
+        .fallback_service(routes())
+        .layer(middleware::from_fn_with_state(machines, pick_machine))
+}
+
+fn routes() -> Router {
     Router::new()
         .route("/health", get(health_check))
+        .route("/api/machines", get(get_machines))
         .route("/api/snapshot", get(get_snapshot))
         .route("/api/tab", pass("tab.create"))
         .route("/api/tab/move", pass("tab.move"))
@@ -51,7 +71,45 @@ pub fn create_router(state: AppState) -> Router {
         .route("/ws/term/{id}", get(ws_term_handler))
         .layer(middleware::from_fn(reject_browsers))
         .layer(TraceLayer::new_for_http())
-        .with_state(state)
+}
+
+async fn pick_machine(State(machines): State<Machines>, mut req: Request, next: Next) -> Response {
+    let mut machine = machines.local;
+    if let Some(rest) = req.uri().path().strip_prefix("/m/") {
+        let (id, rest) = rest.split_once('/').unwrap_or((rest, ""));
+        let (id, path) = (id.to_string(), format!("/{rest}{}", req.uri().query().map_or(String::new(), |q| format!("?{q}"))));
+        let mut remote = machines.remote.lock().await;
+        if !remote.contains_key(&id) {
+            let Some(saved) = saved_machines().await.into_iter().find(|m| m["id"] == id.as_str()) else {
+                return (StatusCode::NOT_FOUND, format!("herdr has no machine {id}")).into_response();
+            };
+            let herdr = Arc::new(HerdrClient::remote(saved["target"].as_str().unwrap_or_default().into()));
+            herdr.clone().start_event_listener();
+            remote.insert(id.clone(), AppState { snapshots: start_snapshot_poller(herdr.clone()), herdr });
+        }
+        machine = remote[&id].clone();
+        drop(remote);
+        *req.uri_mut() = path.parse().unwrap_or_default();
+    }
+    req.extensions_mut().insert(machine);
+    next.run(req).await
+}
+
+/// The enabled machines saved in herdr, as `{id, label, target}`. Only herdr's default session is
+/// reachable: `herdr remote-api-bridge` has no session option.
+async fn saved_machines() -> Vec<Value> {
+    let Ok(out) = Command::new("herdr").args(["machine", "list"]).output().await else { return vec![] };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| match line.split('\t').collect::<Vec<_>>()[..] {
+            [id, label, target, "default", "enabled", ..] => Some(json!({ "id": id, "label": label, "target": target })),
+            _ => None,
+        })
+        .collect()
+}
+
+async fn get_machines() -> Json<Value> {
+    Json(json!({ "machines": saved_machines().await }))
 }
 
 /// Browsers let any web page open a WebSocket to any address, and send its `Origin` with it (and with
@@ -86,7 +144,7 @@ async fn health_check() -> Json<Value> {
     }))
 }
 
-async fn get_snapshot(State(state): State<AppState>) -> Result<Json<Value>, (StatusCode, String)> {
+async fn get_snapshot(Extension(state): Extension<AppState>) -> Result<Json<Value>, (StatusCode, String)> {
     match state.herdr.snapshot().await {
         Ok(snapshot) => Ok(Json(snapshot)),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
@@ -98,8 +156,8 @@ type ApiResult = Result<Json<Value>, (StatusCode, String)>;
 /// A POST whose JSON body goes straight to herdr as `method`'s params, e.g. `tab.move` (`tab_id`,
 /// `insert_index`: the tab goes in front of the one at that index in its workspace's order before the
 /// move) or `workspace.move_block` (`workspace_ids`, `before_workspace_id`, null for the end).
-fn pass(method: &'static str) -> MethodRouter<AppState> {
-    post(move |State(state): State<AppState>, Json(params): Json<Value>| async move { rpc(&state, method, params).await })
+fn pass(method: &'static str) -> MethodRouter {
+    post(move |Extension(state): Extension<AppState>, Json(params): Json<Value>| async move { rpc(&state, method, params).await })
 }
 
 /// One herdr call; its error comes back as a 400 with herdr's message.
@@ -107,11 +165,11 @@ async fn rpc(state: &AppState, method: &str, params: Value) -> ApiResult {
     state.herdr.call(method, params).await.map(Json).map_err(|e| (StatusCode::BAD_REQUEST, e))
 }
 
-async fn delete_tab(State(state): State<AppState>, Path(tab_id): Path<String>) -> ApiResult {
+async fn delete_tab(Extension(state): Extension<AppState>, Path(tab_id): Path<String>) -> ApiResult {
     rpc(&state, "tab.close", json!({ "tab_id": tab_id })).await
 }
 
-async fn delete_pane(State(state): State<AppState>, Path(pane_id): Path<String>) -> ApiResult {
+async fn delete_pane(Extension(state): Extension<AppState>, Path(pane_id): Path<String>) -> ApiResult {
     rpc(&state, "pane.close", json!({ "pane_id": pane_id })).await
 }
 
@@ -122,7 +180,7 @@ struct WorkspaceDeleteQuery {
 }
 
 async fn delete_workspace(
-    State(state): State<AppState>,
+    Extension(state): Extension<AppState>,
     Path(workspace_id): Path<String>,
     Query(query): Query<WorkspaceDeleteQuery>,
 ) -> ApiResult {
@@ -140,7 +198,7 @@ struct RenameBody {
 }
 
 async fn post_tab_rename(
-    State(state): State<AppState>,
+    Extension(state): Extension<AppState>,
     Path(tab_id): Path<String>,
     Json(body): Json<RenameBody>,
 ) -> ApiResult {
@@ -148,7 +206,7 @@ async fn post_tab_rename(
 }
 
 async fn post_workspace_rename(
-    State(state): State<AppState>,
+    Extension(state): Extension<AppState>,
     Path(workspace_id): Path<String>,
     Json(body): Json<RenameBody>,
 ) -> ApiResult {
@@ -160,7 +218,7 @@ struct WorktreeListQuery {
     workspace_id: Option<String>,
 }
 
-async fn get_worktree_list(State(state): State<AppState>, Query(query): Query<WorktreeListQuery>) -> ApiResult {
+async fn get_worktree_list(Extension(state): Extension<AppState>, Query(query): Query<WorktreeListQuery>) -> ApiResult {
     let mut params = json!({});
     if let Some(ws_id) = query.workspace_id {
         params["workspace_id"] = json!(ws_id);
@@ -170,7 +228,7 @@ async fn get_worktree_list(State(state): State<AppState>, Query(query): Query<Wo
 
 async fn ws_session_handler(
     ws: WebSocketUpgrade,
-    State(state): State<AppState>,
+    Extension(state): Extension<AppState>,
 ) -> impl IntoResponse {
     ws.on_upgrade(|socket| handle_ws_session(socket, state))
 }
@@ -178,6 +236,11 @@ async fn ws_session_handler(
 /// The snapshot as `/ws/session` sends it.
 async fn snapshot_message(herdr: &HerdrClient) -> Result<Utf8Bytes, String> {
     Ok(json!({ "type": "snapshot", "data": herdr.snapshot().await? }).to_string().into())
+}
+
+/// Why there is no snapshot (herdr not running, its machine unreachable), for the app to show.
+fn error_message(error: &str) -> Utf8Bytes {
+    json!({ "type": "error", "error": error }).to_string().into()
 }
 
 /// One poller for every connected phone, so the work (a herdr call, and `git` per workspace) doesn't
@@ -205,7 +268,7 @@ pub fn start_snapshot_poller(herdr: Arc<HerdrClient>) -> Arc<watch::Sender<Utf8B
             if tx.receiver_count() == 0 {
                 continue;
             }
-            let Ok(text) = snapshot_message(&herdr).await else { continue };
+            let text = snapshot_message(&herdr).await.unwrap_or_else(|e| error_message(&e));
             tx.send_if_modified(|last| {
                 let changed = *last != text;
                 *last = text;
@@ -223,7 +286,7 @@ async fn handle_ws_session(socket: WebSocket, state: AppState) {
 
     let mut send_task = tokio::spawn(async move {
         // The first snapshot is fetched for this phone: the shared one is stale if none was connected.
-        let mut last = snapshot_message(&herdr).await.unwrap_or_default();
+        let mut last = snapshot_message(&herdr).await.unwrap_or_else(|e| error_message(&e));
         if !last.is_empty() && sender.send(Message::Text(last.clone())).await.is_err() {
             return;
         }
@@ -263,7 +326,7 @@ struct TermSize {
 
 async fn ws_term_handler(
     ws: WebSocketUpgrade,
-    State(state): State<AppState>,
+    Extension(state): Extension<AppState>,
     Path(pane_id): Path<String>,
     Query(size): Query<TermSize>,
 ) -> Response {
@@ -277,7 +340,7 @@ async fn ws_term_handler(
         if let Err(e) = state.herdr.call("pane.focus", json!({ "pane_id": pane_id })).await {
             warn!("Could not focus pane {}: {}", pane_id, e);
         }
-        if let Err(e) = handle_ws_term(socket, pane_id, size).await {
+        if let Err(e) = handle_ws_term(socket, &state.herdr, pane_id, size).await {
             warn!("Terminal session ended with error: {}", e);
         }
     })
@@ -288,10 +351,10 @@ async fn ws_term_handler(
 /// and emits server-rendered ANSI frames. Binary frames carry terminal output/input; text frames
 /// carry typed control commands (e.g. `terminal.scroll`), or else `{"cols","rows"}` resizes.
 /// Herdr's errors (no such pane, no `herdr` on PATH) are written into the terminal, so the app shows why.
-async fn handle_ws_term(mut socket: WebSocket, pane_id: String, size: TermSize) -> std::io::Result<()> {
-    let spawned = Command::new("herdr")
-        .args(["terminal", "session", "control", &pane_id, "--takeover"])
-        .args(["--cols", &size.cols.to_string(), "--rows", &size.rows.to_string()])
+async fn handle_ws_term(mut socket: WebSocket, herdr: &HerdrClient, pane_id: String, size: TermSize) -> std::io::Result<()> {
+    let (cols, rows) = (size.cols.to_string(), size.rows.to_string());
+    let spawned = herdr
+        .command("herdr", &["terminal", "session", "control", &pane_id, "--takeover", "--cols", &cols, "--rows", &rows])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
