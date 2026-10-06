@@ -38,7 +38,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/snapshot", get(get_snapshot))
         .route("/api/pane/{id}/input", post(post_pane_input))
         .route("/api/tab", post(post_tab_create))
+        .route("/api/tab/{id}", delete(delete_tab))
+        .route("/api/tab/{id}/rename", post(post_tab_rename))
         .route("/api/workspace", post(post_workspace_create))
+        .route("/api/workspace/move", post(post_workspace_move))
         .route("/api/workspace/{id}", delete(delete_workspace))
         .route("/api/workspace/{id}/rename", post(post_workspace_rename))
         .route("/api/worktree", get(get_worktree_list).post(post_worktree_create))
@@ -97,12 +100,34 @@ async fn post_tab_create(
     }
 }
 
+async fn delete_tab(
+    State(state): State<AppState>,
+    Path(tab_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    match state.herdr.call("tab.close", json!({ "tab_id": tab_id })).await {
+        Ok(res) => Ok(Json(res)),
+        Err(e) => Err((StatusCode::BAD_REQUEST, e)),
+    }
+}
+
 /// Body is passed straight through as `workspace.create` params (`label`, `cwd`, `focus`).
 async fn post_workspace_create(
     State(state): State<AppState>,
     Json(params): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     match state.herdr.call("workspace.create", params).await {
+        Ok(res) => Ok(Json(res)),
+        Err(e) => Err((StatusCode::BAD_REQUEST, e)),
+    }
+}
+
+/// Body is passed straight through as `workspace.move_block` params (`workspace_ids`,
+/// `before_workspace_id`, null for the end).
+async fn post_workspace_move(
+    State(state): State<AppState>,
+    Json(params): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    match state.herdr.call("workspace.move_block", params).await {
         Ok(res) => Ok(Json(res)),
         Err(e) => Err((StatusCode::BAD_REQUEST, e)),
     }
@@ -134,15 +159,26 @@ async fn delete_workspace(
     }
 }
 
+async fn post_tab_rename(
+    State(state): State<AppState>,
+    Path(tab_id): Path<String>,
+    Json(body): Json<RenameBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    match state.herdr.call("tab.rename", json!({ "tab_id": tab_id, "label": body.label })).await {
+        Ok(res) => Ok(Json(res)),
+        Err(e) => Err((StatusCode::BAD_REQUEST, e)),
+    }
+}
+
 #[derive(Deserialize)]
-struct WorkspaceRenameBody {
+struct RenameBody {
     label: String,
 }
 
 async fn post_workspace_rename(
     State(state): State<AppState>,
     Path(workspace_id): Path<String>,
-    Json(body): Json<WorkspaceRenameBody>,
+    Json(body): Json<RenameBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let params = json!({
         "workspace_id": workspace_id,
@@ -261,10 +297,16 @@ struct TermSize {
 
 async fn ws_term_handler(
     ws: WebSocketUpgrade,
+    State(state): State<AppState>,
     Path(pane_id): Path<String>,
     Query(size): Query<TermSize>,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| async move {
+        // Focusing is what marks a pane seen in herdr (a `done` agent turns `idle`); the takeover alone
+        // doesn't. The desktop follows the phone to this pane.
+        if let Err(e) = state.herdr.call("pane.focus", json!({ "pane_id": pane_id })).await {
+            warn!("Could not focus pane {}: {}", pane_id, e);
+        }
         if let Err(e) = handle_ws_term(socket, pane_id, size).await {
             warn!("Terminal session ended with error: {}", e);
         }
@@ -280,6 +322,7 @@ async fn handle_ws_term(socket: WebSocket, pane_id: String, size: TermSize) -> s
         .args(["--cols", &size.cols.to_string(), "--rows", &size.rows.to_string()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()?;
     let mut stdin = child.stdin.take().expect("piped stdin");
@@ -315,7 +358,9 @@ async fn handle_ws_term(socket: WebSocket, pane_id: String, size: TermSize) -> s
                     Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
                     _ => continue,
                 };
-                stdin.write_all(format!("{cmd}\n").as_bytes()).await?;
+                if let Err(_) = stdin.write_all(format!("{cmd}\n").as_bytes()).await {
+                    break;
+                }
             }
         }
     }
@@ -324,7 +369,7 @@ async fn handle_ws_term(socket: WebSocket, pane_id: String, size: TermSize) -> s
     let _ = stdin.write_all(b"{\"type\":\"terminal.release\"}\n").await;
     drop(stdin);
     if tokio::time::timeout(Duration::from_secs(2), child.wait()).await.is_err() {
-        child.kill().await?;
+        let _ = child.kill().await;
     }
     Ok(())
 }

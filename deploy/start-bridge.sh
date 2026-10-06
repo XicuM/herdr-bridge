@@ -1,28 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-
-# Auto-detect Tailscale IP if available, otherwise bind to 0.0.0.0
-TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || true)
-BIND_ADDR="${TAILSCALE_IP:-0.0.0.0}"
+# Bind to 0.0.0.0 by default to listen on all interfaces (including Tailscale)
+BIND_ADDR="${HERDR_BRIDGE_BIND:-0.0.0.0}"
 PORT="${HERDR_BRIDGE_PORT:-7788}"
 
-BINARY="$ROOT_DIR/bridge/target/release/herdr-bridge"
-if [[ ! -f "$BINARY" ]]; then
-  BINARY="$ROOT_DIR/bridge/target/debug/herdr-bridge"
-fi
+# Look for binary in standard local paths or repo build paths
+BINARY=""
+for candidate in \
+  "$HOME/.local/bin/herdr-bridge" \
+  "$(dirname "$0")/../bridge/target/release/herdr-bridge" \
+  "$(dirname "$0")/../bridge/target/debug/herdr-bridge" \
+  "$(which herdr-bridge 2>/dev/null || true)"
+do
+  if [[ -n "$candidate" && -x "$candidate" && ! -d "$candidate" ]]; then
+    BINARY="$candidate"
+    break
+  fi
+done
 
-if [[ ! -f "$BINARY" ]]; then
-  echo "Error: Binary not found. Run 'cargo build --release' inside $ROOT_DIR/bridge first."
+if [[ -z "$BINARY" ]]; then
+  echo "Error: herdr-bridge binary not found." >&2
   exit 1
 fi
-
-echo "=================================================="
-echo " Starting Herdr Mobile Bridge Daemon"
-echo " Bind Address: http://${BIND_ADDR}:${PORT}"
-echo " Herdr Socket: ${HERDR_SOCKET:-$HOME/.config/herdr/herdr.sock}"
-echo "=================================================="
 
 exec "$BINARY" --bind "$BIND_ADDR" --port "$PORT" "$@"

@@ -32,7 +32,7 @@ fn default_socket_path() -> PathBuf {
     } else if let Ok(home) = std::env::var("HOME") {
         PathBuf::from(home).join(".config/herdr/herdr.sock")
     } else {
-        PathBuf::from("/home/xicu/.config/herdr/herdr.sock")
+        PathBuf::from(".config/herdr/herdr.sock")
     }
 }
 

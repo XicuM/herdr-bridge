@@ -4,11 +4,9 @@ After=network.target
 
 [Service]
 Type=simple
-User=xicu
-WorkingDirectory=/home/xicu/herdr-mobile
-ExecStart=/home/xicu/herdr-mobile/deploy/start-bridge.sh
+ExecStart=%h/.local/bin/start-bridge.sh
 Restart=always
-RestartSec=5
+RestartSec=3
 Environment=RUST_LOG=herdr_bridge=info,tower_http=info
 
 [Install]
