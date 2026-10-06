@@ -1,11 +1,12 @@
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::Command;
 use tokio::sync::broadcast;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[derive(Clone, Debug)]
 pub struct HerdrClient {
@@ -26,38 +27,43 @@ impl HerdrClient {
         self.event_tx.subscribe()
     }
 
-    pub async fn call(&self, method: &str, params: Value) -> Result<Value, String> {
+    /// Opens a connection to herdr and writes one request to it.
+    async fn send(&self, id: &str, method: &str, params: Value) -> Result<UnixStream, String> {
         let mut stream = UnixStream::connect(&self.socket_path)
             .await
             .map_err(|e| format!("Failed to connect to herdr socket at {:?}: {}", self.socket_path, e))?;
-
-        let req_id = format!(
-            "bridge-{}",
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis()
-        );
-        let payload = json!({
-            "id": req_id,
-            "method": method,
-            "params": params,
-        });
-
-        let mut raw = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
+        let mut raw = serde_json::to_vec(&json!({ "id": id, "method": method, "params": params }))
+            .map_err(|e| e.to_string())?;
         raw.push(b'\n');
-
         stream
             .write_all(&raw)
             .await
             .map_err(|e| format!("Failed to write to herdr socket: {}", e))?;
+        Ok(stream)
+    }
 
-        let mut reader = BufReader::new(stream);
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .await
-            .map_err(|e| format!("Failed to read response from herdr: {}", e))?;
+    /// One request and its response. A herdr that doesn't answer fails the call instead of hanging it.
+    pub async fn call(&self, method: &str, params: Value) -> Result<Value, String> {
+        let req_id = format!(
+            "bridge-{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis()
+        );
+        let line = tokio::time::timeout(Duration::from_secs(10), async {
+            let stream = self.send(&req_id, method, params).await?;
+            let mut line = String::new();
+            BufReader::new(stream)
+                .read_line(&mut line)
+                .await
+                .map_err(|e| format!("Failed to read response from herdr: {}", e))?;
+            Ok::<_, String>(line)
+        })
+        .await
+        .map_err(|_| format!("herdr did not answer {method} within 10 s"))??;
 
-        let res: Value = serde_json::from_str(&line)
-            .map_err(|e| format!("Failed to parse herdr response {}: {}", line, e))?;
+        let res: Value = serde_json::from_str(&line).map_err(|e| {
+            debug!("Unparsable herdr response: {}", line);
+            format!("Failed to parse herdr response: {}", e)
+        })?;
 
         if let Some(err) = res.get("error") {
             return Err(format!("Herdr error response: {}", err));
@@ -109,46 +115,17 @@ impl HerdrClient {
         tokio::spawn(async move {
             loop {
                 info!("Connecting event subscriber to herdr socket at {:?}", self.socket_path);
-                match UnixStream::connect(&self.socket_path).await {
-                    Ok(mut stream) => {
-                        let sub_payload = json!({
-                            "id": "bridge-sub-all",
-                            "method": "events.subscribe",
-                            "params": {
-                                "subscriptions": [
-                                    { "type": "workspace.created" },
-                                    { "type": "workspace.updated" },
-                                    { "type": "workspace.focused" },
-                                    { "type": "workspace.closed" },
-                                    { "type": "tab.created" },
-                                    { "type": "tab.focused" },
-                                    { "type": "tab.closed" },
-                                    { "type": "pane.created" },
-                                    { "type": "pane.focused" },
-                                    { "type": "pane.closed" },
-                                    { "type": "pane.updated" },
-                                    { "type": "pane.agent_detected" },
-                                    { "type": "layout.updated" }
-                                ]
-                            }
-                        });
-
-                        let mut raw = match serde_json::to_vec(&sub_payload) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                error!("Failed to serialize subscribe request: {}", e);
-                                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                                continue;
-                            }
-                        };
-                        raw.push(b'\n');
-
-                        if let Err(e) = stream.write_all(&raw).await {
-                            error!("Failed to send subscribe request: {}", e);
-                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                            continue;
-                        }
-
+                let subscriptions: Vec<Value> = [
+                    "workspace.created", "workspace.updated", "workspace.focused", "workspace.closed",
+                    "tab.created", "tab.focused", "tab.closed",
+                    "pane.created", "pane.focused", "pane.closed", "pane.updated", "pane.agent_detected",
+                    "layout.updated",
+                ]
+                .iter()
+                .map(|t| json!({ "type": t }))
+                .collect();
+                match self.send("bridge-sub-all", "events.subscribe", json!({ "subscriptions": subscriptions })).await {
+                    Ok(stream) => {
                         let (reader, writer) = stream.into_split();
                         let mut lines = BufReader::new(reader).lines();
                         let _keep_writer_alive = writer;
@@ -163,17 +140,18 @@ impl HerdrClient {
                                     let _ = self.event_tx.send(val);
                                 }
                                 Err(e) => {
-                                    warn!("Received unparsable JSON event: {} - {}", e, line);
+                                    warn!("Received unparsable JSON event: {}", e);
+                                    debug!("Unparsable event: {}", line);
                                 }
                             }
                         }
                         warn!("Herdr event stream closed. Reconnecting in 3 seconds...");
                     }
                     Err(e) => {
-                        error!("Failed to connect to herdr socket for events: {}. Retrying in 3s...", e);
+                        error!("Failed to subscribe to herdr events: {}. Retrying in 3s...", e);
                     }
                 }
-                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                tokio::time::sleep(Duration::from_secs(3)).await;
             }
         });
     }

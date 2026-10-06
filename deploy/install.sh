@@ -52,16 +52,17 @@ else
 fi
 
 # 3. Connection instructions for mobile
-TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || true)
+TAILSCALE_IP=$(tailscale ip -4 2>/dev/null | head -n1 || true)
+PORT="${HERDR_BRIDGE_PORT:-7788}"
 echo ""
 echo "=================================================="
 echo " Herdr Bridge is now running in the background!"
 if [[ -n "$TAILSCALE_IP" ]]; then
   echo " Tailscale IP : $TAILSCALE_IP"
-  echo " Port         : 7788"
-  echo " In the mobile app, connect to: $TAILSCALE_IP:7788"
+  echo " Port         : $PORT"
+  echo " In the mobile app, connect to: $TAILSCALE_IP:$PORT"
 else
-  echo " Port         : 7788"
-  echo " Tailscale was not detected. Enter your host IP:7788 in the mobile app."
+  echo " Port         : $PORT"
+  echo " Tailscale was not detected. Enter your host IP:$PORT in the mobile app."
 fi
 echo "=================================================="

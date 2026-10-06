@@ -8,16 +8,13 @@
     <array>
         <string>/bin/bash</string>
         <string>-c</string>
-        <string>PATH="$HOME/.local/bin:$HOME/bin:/usr/local/bin:/opt/homebrew/bin:$PATH" exec "$HOME/.local/bin/start-bridge.sh"</string>
+        <!-- Logs go to the user's own Library rather than the shared /tmp: they name panes and workspaces. -->
+        <string>mkdir -p "$HOME/Library/Logs"; PATH="$HOME/.local/bin:$HOME/bin:/usr/local/bin:/opt/homebrew/bin:$PATH" exec "$HOME/.local/bin/start-bridge.sh" &gt;&gt;"$HOME/Library/Logs/herdr-bridge.log" 2&gt;&amp;1</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
-    <key>StandardOutPath</key>
-    <string>/tmp/herdr-bridge.stdout.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/herdr-bridge.stderr.log</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>RUST_LOG</key>

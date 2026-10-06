@@ -4,7 +4,7 @@ mod server;
 use clap::Parser;
 use herdr::HerdrClient;
 use server::{create_router, AppState};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
@@ -59,11 +59,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = AppState {
         herdr: herdr.clone(),
+        snapshots: server::start_snapshot_poller(herdr.clone()),
     };
 
     let app = create_router(state);
 
-    let addr: SocketAddr = format!("{}:{}", args.bind, args.port).parse()?;
+    // An IPv6 bind needs no brackets this way.
+    let addr = SocketAddr::new(args.bind.parse::<IpAddr>()?, args.port);
     info!("Herdr Mobile Bridge listening on http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
