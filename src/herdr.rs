@@ -31,7 +31,10 @@ impl HerdrClient {
             .await
             .map_err(|e| format!("Failed to connect to herdr socket at {:?}: {}", self.socket_path, e))?;
 
-        let req_id = format!("bridge-{}", uuid_or_timestamp());
+        let req_id = format!(
+            "bridge-{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis()
+        );
         let payload = json!({
             "id": req_id,
             "method": method,
@@ -102,19 +105,6 @@ impl HerdrClient {
         Ok(res)
     }
 
-    pub async fn send_input(&self, pane_id: &str, text: Option<&str>, keys: Option<Vec<String>>) -> Result<Value, String> {
-        let mut params = json!({
-            "pane_id": pane_id
-        });
-        if let Some(t) = text {
-            params["text"] = Value::String(t.to_string());
-        }
-        if let Some(k) = keys {
-            params["keys"] = json!(k);
-        }
-        self.call("pane.send_input", params).await
-    }
-
     pub fn start_event_listener(self: Arc<Self>) {
         tokio::spawn(async move {
             loop {
@@ -177,7 +167,7 @@ impl HerdrClient {
                                 }
                             }
                         }
-                        warn!("Herdr event stream closed. Reconnecting in 2 seconds...");
+                        warn!("Herdr event stream closed. Reconnecting in 3 seconds...");
                     }
                     Err(e) => {
                         error!("Failed to connect to herdr socket for events: {}. Retrying in 3s...", e);
@@ -187,11 +177,4 @@ impl HerdrClient {
             }
         });
     }
-}
-
-fn uuid_or_timestamp() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
 }

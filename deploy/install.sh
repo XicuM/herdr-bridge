@@ -42,7 +42,7 @@ elif [[ "$OS" == "Linux" ]]; then
   cp "$SCRIPT_DIR/herdr-bridge.service" "$SYSTEMD_USER_DIR/herdr-bridge.service"
   
   systemctl --user daemon-reload
-  systemctl --user enable --now herdr-bridge.service
+  systemctl --user enable herdr-bridge.service
   systemctl --user restart herdr-bridge.service
   echo "Started herdr-bridge background service via systemd --user"
 else

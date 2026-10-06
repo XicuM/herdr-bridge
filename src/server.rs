@@ -2,10 +2,11 @@ use crate::herdr::HerdrClient;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, Query, State,
+        Path, Query, Request, State,
     },
-    http::StatusCode,
-    response::{IntoResponse, Json},
+    http::{header, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Json, Response},
     routing::{delete, get, post},
     Router,
 };
@@ -18,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tower_http::cors::{Any, CorsLayer};
+use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tower_http::trace::TraceLayer;
 use tracing::warn;
 
@@ -28,15 +29,9 @@ pub struct AppState {
 }
 
 pub fn create_router(state: AppState) -> Router {
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
-
     Router::new()
         .route("/health", get(health_check))
         .route("/api/snapshot", get(get_snapshot))
-        .route("/api/pane/{id}/input", post(post_pane_input))
         .route("/api/tab", post(post_tab_create))
         .route("/api/tab/{id}", delete(delete_tab))
         .route("/api/tab/{id}/rename", post(post_tab_rename))
@@ -48,9 +43,20 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/worktree/open", post(post_worktree_open))
         .route("/ws/session", get(ws_session_handler))
         .route("/ws/term/{id}", get(ws_term_handler))
-        .layer(cors)
+        .layer(middleware::from_fn(reject_browsers))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// Browsers let any web page open a WebSocket to any address, and send its `Origin` with it (and with
+/// every cross-site or non-GET request); the app's Dart client sends none. So a request that carries one
+/// comes from a web page, which could otherwise type into a terminal: refuse it.
+async fn reject_browsers(req: Request, next: Next) -> Response {
+    if req.headers().contains_key(header::ORIGIN) {
+        warn!("Refused a browser request to {} (Origin {:?})", req.uri(), req.headers()[header::ORIGIN]);
+        return (StatusCode::FORBIDDEN, "herdr-bridge only accepts the Herdr Mobile app").into_response();
+    }
+    next.run(req).await
 }
 
 async fn health_check() -> Json<Value> {
@@ -68,69 +74,31 @@ async fn get_snapshot(State(state): State<AppState>) -> Result<Json<Value>, (Sta
     }
 }
 
-#[derive(Deserialize)]
-struct PaneInputBody {
-    text: Option<String>,
-    keys: Option<Vec<String>>,
-}
+type ApiResult = Result<Json<Value>, (StatusCode, String)>;
 
-async fn post_pane_input(
-    State(state): State<AppState>,
-    Path(pane_id): Path<String>,
-    Json(body): Json<PaneInputBody>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    match state
-        .herdr
-        .send_input(&pane_id, body.text.as_deref(), body.keys)
-        .await
-    {
-        Ok(res) => Ok(Json(res)),
-        Err(e) => Err((StatusCode::BAD_REQUEST, e)),
-    }
+/// One herdr call; its error comes back as a 400 with herdr's message.
+async fn rpc(state: &AppState, method: &str, params: Value) -> ApiResult {
+    state.herdr.call(method, params).await.map(Json).map_err(|e| (StatusCode::BAD_REQUEST, e))
 }
 
 /// Body is passed straight through as `tab.create` params (`workspace_id`, `label`, `cwd`, `focus`).
-async fn post_tab_create(
-    State(state): State<AppState>,
-    Json(params): Json<Value>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    match state.herdr.call("tab.create", params).await {
-        Ok(res) => Ok(Json(res)),
-        Err(e) => Err((StatusCode::BAD_REQUEST, e)),
-    }
+async fn post_tab_create(State(state): State<AppState>, Json(params): Json<Value>) -> ApiResult {
+    rpc(&state, "tab.create", params).await
 }
 
-async fn delete_tab(
-    State(state): State<AppState>,
-    Path(tab_id): Path<String>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    match state.herdr.call("tab.close", json!({ "tab_id": tab_id })).await {
-        Ok(res) => Ok(Json(res)),
-        Err(e) => Err((StatusCode::BAD_REQUEST, e)),
-    }
+async fn delete_tab(State(state): State<AppState>, Path(tab_id): Path<String>) -> ApiResult {
+    rpc(&state, "tab.close", json!({ "tab_id": tab_id })).await
 }
 
 /// Body is passed straight through as `workspace.create` params (`label`, `cwd`, `focus`).
-async fn post_workspace_create(
-    State(state): State<AppState>,
-    Json(params): Json<Value>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    match state.herdr.call("workspace.create", params).await {
-        Ok(res) => Ok(Json(res)),
-        Err(e) => Err((StatusCode::BAD_REQUEST, e)),
-    }
+async fn post_workspace_create(State(state): State<AppState>, Json(params): Json<Value>) -> ApiResult {
+    rpc(&state, "workspace.create", params).await
 }
 
 /// Body is passed straight through as `workspace.move_block` params (`workspace_ids`,
 /// `before_workspace_id`, null for the end).
-async fn post_workspace_move(
-    State(state): State<AppState>,
-    Json(params): Json<Value>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    match state.herdr.call("workspace.move_block", params).await {
-        Ok(res) => Ok(Json(res)),
-        Err(e) => Err((StatusCode::BAD_REQUEST, e)),
-    }
+async fn post_workspace_move(State(state): State<AppState>, Json(params): Json<Value>) -> ApiResult {
+    rpc(&state, "workspace.move_block", params).await
 }
 
 #[derive(Deserialize)]
@@ -143,31 +111,13 @@ async fn delete_workspace(
     State(state): State<AppState>,
     Path(workspace_id): Path<String>,
     Query(query): Query<WorkspaceDeleteQuery>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    let method = if query.remove_worktree.unwrap_or(false) {
-        "worktree.remove"
-    } else {
-        "workspace.close"
-    };
+) -> ApiResult {
+    let method = if query.remove_worktree.unwrap_or(false) { "worktree.remove" } else { "workspace.close" };
     let mut params = json!({ "workspace_id": workspace_id });
     if let Some(force) = query.force {
         params["force"] = json!(force);
     }
-    match state.herdr.call(method, params).await {
-        Ok(res) => Ok(Json(res)),
-        Err(e) => Err((StatusCode::BAD_REQUEST, e)),
-    }
-}
-
-async fn post_tab_rename(
-    State(state): State<AppState>,
-    Path(tab_id): Path<String>,
-    Json(body): Json<RenameBody>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    match state.herdr.call("tab.rename", json!({ "tab_id": tab_id, "label": body.label })).await {
-        Ok(res) => Ok(Json(res)),
-        Err(e) => Err((StatusCode::BAD_REQUEST, e)),
-    }
+    rpc(&state, method, params).await
 }
 
 #[derive(Deserialize)]
@@ -175,19 +125,20 @@ struct RenameBody {
     label: String,
 }
 
+async fn post_tab_rename(
+    State(state): State<AppState>,
+    Path(tab_id): Path<String>,
+    Json(body): Json<RenameBody>,
+) -> ApiResult {
+    rpc(&state, "tab.rename", json!({ "tab_id": tab_id, "label": body.label })).await
+}
+
 async fn post_workspace_rename(
     State(state): State<AppState>,
     Path(workspace_id): Path<String>,
     Json(body): Json<RenameBody>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    let params = json!({
-        "workspace_id": workspace_id,
-        "label": body.label,
-    });
-    match state.herdr.call("workspace.rename", params).await {
-        Ok(res) => Ok(Json(res)),
-        Err(e) => Err((StatusCode::BAD_REQUEST, e)),
-    }
+) -> ApiResult {
+    rpc(&state, "workspace.rename", json!({ "workspace_id": workspace_id, "label": body.label })).await
 }
 
 #[derive(Deserialize)]
@@ -195,38 +146,20 @@ struct WorktreeListQuery {
     workspace_id: Option<String>,
 }
 
-async fn get_worktree_list(
-    State(state): State<AppState>,
-    Query(query): Query<WorktreeListQuery>,
-) -> Result<Json<Value>, (StatusCode, String)> {
+async fn get_worktree_list(State(state): State<AppState>, Query(query): Query<WorktreeListQuery>) -> ApiResult {
     let mut params = json!({});
     if let Some(ws_id) = query.workspace_id {
         params["workspace_id"] = json!(ws_id);
     }
-    match state.herdr.call("worktree.list", params).await {
-        Ok(res) => Ok(Json(res)),
-        Err(e) => Err((StatusCode::BAD_REQUEST, e)),
-    }
+    rpc(&state, "worktree.list", params).await
 }
 
-async fn post_worktree_create(
-    State(state): State<AppState>,
-    Json(params): Json<Value>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    match state.herdr.call("worktree.create", params).await {
-        Ok(res) => Ok(Json(res)),
-        Err(e) => Err((StatusCode::BAD_REQUEST, e)),
-    }
+async fn post_worktree_create(State(state): State<AppState>, Json(params): Json<Value>) -> ApiResult {
+    rpc(&state, "worktree.create", params).await
 }
 
-async fn post_worktree_open(
-    State(state): State<AppState>,
-    Json(params): Json<Value>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    match state.herdr.call("worktree.open", params).await {
-        Ok(res) => Ok(Json(res)),
-        Err(e) => Err((StatusCode::BAD_REQUEST, e)),
-    }
+async fn post_worktree_open(State(state): State<AppState>, Json(params): Json<Value>) -> ApiResult {
+    rpc(&state, "worktree.open", params).await
 }
 
 async fn ws_session_handler(
@@ -242,31 +175,29 @@ async fn handle_ws_session(socket: WebSocket, state: AppState) {
     let herdr = state.herdr.clone();
 
     let mut send_task = tokio::spawn(async move {
-        // Herdr's global event subscription carries no agent status changes, so the snapshot is also
-        // polled and pushed whenever it changed: that is how the app sees agents start waiting or
-        // finish (and raises its alerts). The first tick sends the initial snapshot.
+        // A herdr event pushes the new snapshot right away. Herdr's global event subscription carries no
+        // agent status changes, though, so the snapshot is also polled and pushed whenever it changed:
+        // that is how the app sees agents start waiting or finish (and raises its alerts). The first tick
+        // sends the initial snapshot.
         let mut last = String::new();
         let mut tick = tokio::time::interval(Duration::from_millis(1500));
         loop {
-            let text = tokio::select! {
-                _ = tick.tick() => {
-                    let Ok(snapshot) = herdr.snapshot().await else { continue };
-                    let text = json!({ "type": "snapshot", "data": snapshot }).to_string();
-                    if text == last {
-                        continue;
-                    }
-                    last = text.clone();
-                    text
-                }
+            tokio::select! {
+                _ = tick.tick() => {}
                 event = event_rx.recv() => match event {
-                    Ok(event) => json!({ "type": "event", "data": event }).to_string(),
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("Session WS client lagged by {} events", n);
-                        continue;
+                    // A burst of events makes one snapshot.
+                    Ok(_) | Err(RecvError::Lagged(_)) => {
+                        while matches!(event_rx.try_recv(), Ok(_) | Err(TryRecvError::Lagged(_))) {}
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(RecvError::Closed) => break,
                 },
-            };
+            }
+            let Ok(snapshot) = herdr.snapshot().await else { continue };
+            let text = json!({ "type": "snapshot", "data": snapshot }).to_string();
+            if text == last {
+                continue;
+            }
+            last = text.clone();
             if sender.send(Message::Text(text.into())).await.is_err() {
                 break;
             }
@@ -315,7 +246,7 @@ async fn ws_term_handler(
 
 /// Streams one pane through `herdr terminal session control`, which sizes the pane to the viewer
 /// and emits server-rendered ANSI frames. Binary frames carry terminal output/input; text frames
-/// carry `{"cols","rows"}` resizes.
+/// carry typed control commands (e.g. `terminal.scroll`), or else `{"cols","rows"}` resizes.
 async fn handle_ws_term(socket: WebSocket, pane_id: String, size: TermSize) -> std::io::Result<()> {
     let mut child = Command::new("herdr")
         .args(["terminal", "session", "control", &pane_id, "--takeover"])
@@ -332,15 +263,16 @@ async fn handle_ws_term(socket: WebSocket, pane_id: String, size: TermSize) -> s
     loop {
         tokio::select! {
             line = frames.next_line() => {
-                let Some(line) = line? else { break };
+                // On a read error too, fall through to the release below.
+                let Ok(Some(line)) = line else { break };
                 let Ok(frame) = serde_json::from_str::<Value>(&line) else { continue };
                 if frame["type"] == "terminal.closed" {
                     break;
                 }
-                if let Some(bytes) = frame["bytes"].as_str().and_then(|b| BASE64.decode(b).ok()) {
-                    if sender.send(Message::Binary(bytes.into())).await.is_err() {
-                        break;
-                    }
+                if let Some(bytes) = frame["bytes"].as_str().and_then(|b| BASE64.decode(b).ok())
+                    && sender.send(Message::Binary(bytes.into())).await.is_err()
+                {
+                    break;
                 }
             }
             msg = receiver.next() => {
@@ -358,7 +290,7 @@ async fn handle_ws_term(socket: WebSocket, pane_id: String, size: TermSize) -> s
                     Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
                     _ => continue,
                 };
-                if let Err(_) = stdin.write_all(format!("{cmd}\n").as_bytes()).await {
+                if stdin.write_all(format!("{cmd}\n").as_bytes()).await.is_err() {
                     break;
                 }
             }

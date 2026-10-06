@@ -8,6 +8,8 @@ ExecStart=%h/.local/bin/start-bridge.sh
 Restart=always
 RestartSec=3
 Environment=RUST_LOG=herdr_bridge=info,tower_http=info
+# The bridge runs `herdr` and `git`, and the script `tailscale`; a user unit's default PATH misses user installs.
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
 
 [Install]
 WantedBy=default.target
