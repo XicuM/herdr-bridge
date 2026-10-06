@@ -35,6 +35,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/tab", post(post_tab_create))
         .route("/api/tab/{id}", delete(delete_tab))
         .route("/api/tab/{id}/rename", post(post_tab_rename))
+        .route("/api/pane/{id}", delete(delete_pane))
         .route("/api/workspace", post(post_workspace_create))
         .route("/api/workspace/move", post(post_workspace_move))
         .route("/api/workspace/{id}", delete(delete_workspace))
@@ -88,6 +89,10 @@ async fn post_tab_create(State(state): State<AppState>, Json(params): Json<Value
 
 async fn delete_tab(State(state): State<AppState>, Path(tab_id): Path<String>) -> ApiResult {
     rpc(&state, "tab.close", json!({ "tab_id": tab_id })).await
+}
+
+async fn delete_pane(State(state): State<AppState>, Path(pane_id): Path<String>) -> ApiResult {
+    rpc(&state, "pane.close", json!({ "pane_id": pane_id })).await
 }
 
 /// Body is passed straight through as `workspace.create` params (`label`, `cwd`, `focus`).
