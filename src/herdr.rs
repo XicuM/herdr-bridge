@@ -15,6 +15,10 @@ pub struct HerdrClient {
     /// The SSH target of a machine saved in herdr (`herdr machine list`), reached through
     /// `herdr remote-api-bridge` there, as herdr's own `--machine` does; none for this machine.
     ssh: Option<String>,
+    /// Its id in herdr, to ask herdr why it can't be reached.
+    machine: Option<String>,
+    /// The herdr session there, when not the default one.
+    session: Option<String>,
     event_tx: broadcast::Sender<Value>,
 }
 
@@ -27,18 +31,50 @@ impl HerdrClient {
         Self {
             socket_path: socket_path.into(),
             ssh: None,
+            machine: None,
+            session: None,
             event_tx,
         }
     }
 
-    pub fn remote(ssh: String) -> Self {
-        Self { ssh: Some(ssh), ..Self::new("") }
+    pub fn remote(id: String, ssh: String, session: String) -> Self {
+        let session = (session != "default").then_some(session);
+        Self { ssh: Some(ssh), machine: Some(id), session, ..Self::new("") }
+    }
+
+    /// Why herdr can't reach this machine either, as `herdr --machine` puts it (e.g. "remote Herdr does
+    /// not support machine API forwarding; update Herdr on this machine"), or just "Error" when herdr
+    /// can. This machine's own failure is the bridge's [error], since herdr has nothing to add.
+    pub async fn machine_error(&self, error: String) -> String {
+        let Some(id) = &self.machine else { return error };
+        let Ok(out) = Command::new("herdr").args(["--machine", id, "api", "snapshot"]).output().await else {
+            return "Error".into();
+        };
+        // herdr prints `Error: Custom { kind: Other, error: "<message>" }`.
+        let text = String::from_utf8_lossy(&out.stderr);
+        let text = text.trim();
+        if text.is_empty() {
+            return "Error".into();
+        }
+        let message = text.split_once("error: \"").and_then(|(_, m)| m.rsplit_once('"')).map_or(text, |(m, _)| m);
+        // herdr's message leads with "machine '<label>'", maybe with " (session <name>)", and ": ".
+        match message.strip_prefix("machine '").and_then(|m| m.split_once(": ")) {
+            Some((_, m)) => m.to_string(),
+            None => message.to_string(),
+        }
     }
 
     /// [program] run on herdr's machine: here, or there over SSH. The SSH connection is shared between
     /// commands, so after the first each one costs little; BatchMode, since nobody is there to type a
     /// password (`herdr machine reconnect` in a terminal authenticates a machine that needs one).
     pub fn command(&self, program: &str, args: &[&str]) -> Command {
+        // herdr's own commands go to its session there.
+        let session = match &self.session {
+            Some(session) if program == "herdr" => vec!["--session", session.as_str()],
+            _ => vec![],
+        };
+        let args: Vec<&str> = session.into_iter().chain(args.iter().copied()).collect();
+        let args = &args[..];
         let Some(target) = &self.ssh else {
             let mut cmd = Command::new(program);
             cmd.args(args);
@@ -135,6 +171,19 @@ impl HerdrClient {
     pub async fn snapshot(&self) -> Result<Value, String> {
         let mut res = self.call("session.snapshot", json!({})).await?;
         let snap = if res.get("snapshot").is_some() { &mut res["snapshot"] } else { &mut res };
+        // The app reads neither the layouts, whose scroll offsets move as panes scroll, nor a raw title
+        // that has a stripped one, whose spinner turns every second or so while an agent works. Without
+        // them the snapshot changes, and is pushed to the phones, only when something they show does.
+        if let Some(snap) = snap.as_object_mut() {
+            snap.remove("layouts");
+        }
+        for list in ["panes", "agents"] {
+            for item in snap[list].as_array_mut().into_iter().flatten() {
+                if let Some(item) = item.as_object_mut().filter(|i| i.contains_key("terminal_title_stripped")) {
+                    item.remove("terminal_title");
+                }
+            }
+        }
         let panes = snap["panes"].as_array().cloned().unwrap_or_default();
         let Some(workspaces) = snap["workspaces"].as_array_mut() else { return Ok(res) };
 
@@ -159,6 +208,14 @@ impl HerdrClient {
         let mut cmd = self.command("sh", &args);
         cmd.kill_on_drop(true);
         let Ok(Ok(out)) = tokio::time::timeout(Duration::from_secs(10), cmd.output()).await else { return Ok(res) };
+        if let Some(agents) = snap["agents"].as_array_mut() {
+            for agent in agents {
+                let name = agent["agent"].as_str().or(agent["name"].as_str()).unwrap_or("");
+                if let Some(usage) = get_agent_usage(name) {
+                    agent["usage"] = usage;
+                }
+            }
+        }
         for (ws, branch) in workspaces.iter_mut().zip(String::from_utf8_lossy(&out.stdout).lines()) {
             if !branch.trim().is_empty() {
                 ws["git_branch"] = Value::String(branch.trim().to_string());
@@ -217,4 +274,61 @@ impl HerdrClient {
             }
         });
     }
+}
+
+/// Usage and quota metrics for an agent, read from local state or config files.
+fn get_agent_usage(agent_name: &str) -> Option<Value> {
+    let agent_id = match agent_name {
+        "agy" => "gemini",
+        other => other,
+    };
+    let state_dir = std::env::var("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::var("HOME")
+                .map(|h| PathBuf::from(h).join(".local/state"))
+                .unwrap_or_else(|_| PathBuf::from("/tmp"))
+        });
+    let usage_file = state_dir.join("omarchy/agents/usage").join(format!("{agent_id}.json"));
+    if let Ok(content) = std::fs::read_to_string(&usage_file) {
+        if let Ok(json) = serde_json::from_str::<Value>(&content) {
+            return Some(json!({
+                "tier_label": json.get("tierLabel"),
+                "limits": json.get("limits").unwrap_or(&Value::Array(vec![])),
+                "today_tokens": json.get("todayTotalTokens"),
+                "today_prompts": json.get("todayPrompts"),
+            }));
+        }
+    }
+
+    if agent_id == "claude" {
+        if let Ok(home) = std::env::var("HOME") {
+            let cred_path = PathBuf::from(home).join(".claude/.credentials.json");
+            if let Ok(content) = std::fs::read_to_string(&cred_path) {
+                if let Ok(json) = serde_json::from_str::<Value>(&content) {
+                    let mut tier = json
+                        .get("claudeAiOauth")
+                        .and_then(|o| o.get("subscriptionType"))
+                        .and_then(|s| s.as_str())
+                        .map(|s| {
+                            let mut c = s.chars();
+                            match c.next() {
+                                None => String::new(),
+                                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                            }
+                        });
+                    if let Some(rate_tier) = json.get("claudeAiOauth").and_then(|o| o.get("rateLimitTier")).and_then(|s| s.as_str()) {
+                        if rate_tier.contains("max_") {
+                            tier = Some(format!("Max {}", &rate_tier[4..]));
+                        }
+                    }
+                    return Some(json!({
+                        "tier_label": tier,
+                        "limits": [],
+                    }));
+                }
+            }
+        }
+    }
+    None
 }

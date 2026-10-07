@@ -54,7 +54,8 @@ pub fn create_router(local: AppState) -> Router {
 fn routes() -> Router {
     Router::new()
         .route("/health", get(health_check))
-        .route("/api/machines", get(get_machines))
+        .route("/api/machines", get(get_machines).post(post_machine))
+        .route("/api/machines/{id}", delete(delete_machine).post(post_machine_edit))
         .route("/api/snapshot", get(get_snapshot))
         .route("/api/tab", pass("tab.create"))
         .route("/api/tab/move", pass("tab.move"))
@@ -83,7 +84,11 @@ async fn pick_machine(State(machines): State<Machines>, mut req: Request, next: 
             let Some(saved) = saved_machines().await.into_iter().find(|m| m["id"] == id.as_str()) else {
                 return (StatusCode::NOT_FOUND, format!("herdr has no machine {id}")).into_response();
             };
-            let herdr = Arc::new(HerdrClient::remote(saved["target"].as_str().unwrap_or_default().into()));
+            let herdr = Arc::new(HerdrClient::remote(
+                id.clone(),
+                saved["target"].as_str().unwrap_or_default().into(),
+                saved["session"].as_str().unwrap_or("default").into(),
+            ));
             herdr.clone().start_event_listener();
             remote.insert(id.clone(), AppState { snapshots: start_snapshot_poller(herdr.clone()), herdr });
         }
@@ -95,21 +100,90 @@ async fn pick_machine(State(machines): State<Machines>, mut req: Request, next: 
     next.run(req).await
 }
 
-/// The enabled machines saved in herdr, as `{id, label, target}`. Only herdr's default session is
-/// reachable: `herdr remote-api-bridge` has no session option.
+/// The enabled machines saved in herdr, as `{id, label, target, session}`.
 async fn saved_machines() -> Vec<Value> {
-    let Ok(out) = Command::new("herdr").args(["machine", "list"]).output().await else { return vec![] };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|line| match line.split('\t').collect::<Vec<_>>()[..] {
-            [id, label, target, "default", "enabled", ..] => Some(json!({ "id": id, "label": label, "target": target })),
-            _ => None,
-        })
+    let Ok(out) = Command::new("herdr").args(["machine", "list", "--json"]).output().await else { return vec![] };
+    let machines: Vec<Value> = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    machines
+        .into_iter()
+        .filter(|m| m["enabled"] == true)
+        .map(|m| json!({ "id": m["id"], "label": m["label"], "target": m["target"], "session": m["session"] }))
         .collect()
 }
 
 async fn get_machines() -> Json<Value> {
     Json(json!({ "machines": saved_machines().await }))
+}
+
+#[derive(Deserialize)]
+struct NewMachine {
+    target: String,
+    label: Option<String>,
+}
+
+/// Saves an SSH machine in this herdr (`herdr machine add`, which also gets herdr ready there), so it
+/// is reached as the others are. With no terminal, SSH can't ask for a password: the key must work.
+async fn post_machine(Json(new): Json<NewMachine>) -> ApiResult {
+    // herdr's parser has no `--`: a target starting with `-` would be an option.
+    if new.target.is_empty() || new.target.starts_with('-') || new.label.as_deref().is_some_and(|l| l.starts_with('-')) {
+        return Err((StatusCode::BAD_REQUEST, "Invalid SSH target or name".into()));
+    }
+    let mut args = vec!["machine".to_string(), "add".into(), new.target];
+    if let Some(label) = new.label.filter(|l| !l.is_empty()) {
+        args.extend(["--label".into(), label]);
+    }
+    herdr_cli(&args).await.map(|_| Json(json!({})))
+}
+
+/// Renames a saved machine (`herdr machine rename`) and, given another target, moves it there. herdr
+/// can't change a machine's target, so it is added anew (keeping its session) and the old one removed
+/// once that worked, so a wrong target loses nothing; it then has a new id.
+async fn post_machine_edit(Path(id): Path<String>, Json(edit): Json<NewMachine>) -> ApiResult {
+    let Some(saved) = saved_machines().await.into_iter().find(|m| m["id"] == id.as_str()) else {
+        return Err((StatusCode::NOT_FOUND, format!("herdr has no machine {id}")));
+    };
+    let label = edit.label.filter(|l| !l.is_empty()).unwrap_or_else(|| saved["label"].as_str().unwrap_or_default().into());
+    if label.starts_with('-') {
+        return Err((StatusCode::BAD_REQUEST, "Invalid name".into()));
+    }
+    let mut id = id;
+    if edit.target != saved["target"] {
+        if edit.target.is_empty() || edit.target.starts_with('-') {
+            return Err((StatusCode::BAD_REQUEST, "Invalid SSH target".into()));
+        }
+        let before: Vec<Value> = saved_machines().await.into_iter().map(|m| m["id"].clone()).collect();
+        let session = saved["session"].as_str().unwrap_or("default").to_string();
+        herdr_cli(&["machine".into(), "add".into(), edit.target, "--remote-session".into(), session]).await?;
+        let added = saved_machines().await.into_iter().find(|m| !before.contains(&m["id"]));
+        let Some(new_id) = added.and_then(|m| m["id"].as_str().map(String::from)) else {
+            return Err((StatusCode::BAD_REQUEST, "herdr saved no new machine".into()));
+        };
+        herdr_cli(&["machine".into(), "remove".into(), id]).await?;
+        id = new_id;
+    }
+    herdr_cli(&["machine".into(), "rename".into(), id.clone(), "--label".into(), label]).await?;
+    Ok(Json(json!({ "id": id })))
+}
+
+async fn delete_machine(Path(id): Path<String>) -> ApiResult {
+    if id.starts_with('-') {
+        return Err((StatusCode::BAD_REQUEST, "Invalid machine".into()));
+    }
+    herdr_cli(&["machine".into(), "remove".into(), id]).await.map(|_| Json(json!({})))
+}
+
+/// One `herdr` command on this machine; when it fails, its last line of output comes back as a 400.
+async fn herdr_cli(args: &[String]) -> Result<(), (StatusCode, String)> {
+    let out = tokio::time::timeout(Duration::from_secs(120), Command::new("herdr").args(args).stdin(Stdio::null()).output())
+        .await
+        .map_err(|_| (StatusCode::BAD_REQUEST, "herdr took too long".to_string()))?
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Failed to run herdr: {e}")))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let text = [out.stderr, out.stdout].concat();
+    let text = String::from_utf8_lossy(&text);
+    Err((StatusCode::BAD_REQUEST, text.trim().lines().last().unwrap_or("Error").to_string()))
 }
 
 /// Browsers let any web page open a WebSocket to any address, and send its `Origin` with it (and with
@@ -235,7 +309,10 @@ async fn ws_session_handler(
 
 /// The snapshot as `/ws/session` sends it.
 async fn snapshot_message(herdr: &HerdrClient) -> Result<Utf8Bytes, String> {
-    Ok(json!({ "type": "snapshot", "data": herdr.snapshot().await? }).to_string().into())
+    match herdr.snapshot().await {
+        Ok(snapshot) => Ok(json!({ "type": "snapshot", "data": snapshot }).to_string().into()),
+        Err(e) => Err(herdr.machine_error(e).await),
+    }
 }
 
 /// Why there is no snapshot (herdr not running, its machine unreachable), for the app to show.
