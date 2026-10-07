@@ -22,6 +22,23 @@ pub struct HerdrClient {
     event_tx: broadcast::Sender<Value>,
 }
 
+/// Where the shared SSH connections' sockets go: a directory only this user can enter. ssh joins whatever
+/// socket is at that path, so one in a shared directory like `/tmp` (as `%C` is predictable) could be
+/// planted by another user to see and answer every command, keystrokes included. `XDG_RUNTIME_DIR` is
+/// such a directory where it is set (systemd); elsewhere (launchd) `~/.ssh`, made 0700 if missing.
+fn control_dir() -> PathBuf {
+    static DIR: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
+        if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+            return PathBuf::from(dir);
+        }
+        let dir = PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".ssh");
+        use std::os::unix::fs::DirBuilderExt;
+        let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
+        dir
+    });
+    DIR.clone()
+}
+
 /// One connection to herdr's API: its reader, its writer, and the `ssh` carrying it, if any.
 type Conn = (Box<dyn AsyncRead + Unpin + Send>, Box<dyn AsyncWrite + Unpin + Send>, Option<Child>);
 
@@ -80,7 +97,7 @@ impl HerdrClient {
             cmd.args(args);
             return cmd;
         };
-        let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+        let dir = control_dir();
         // The remote shell parses the command line: every argument is quoted. A non-interactive login
         // may lack `~/.local/bin`, where herdr installs itself.
         let quoted: Vec<String> = [program].iter().chain(args).map(|a| format!("'{}'", a.replace('\'', r"'\''"))).collect();
@@ -88,7 +105,7 @@ impl HerdrClient {
         cmd.args(["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=15"])
             .args(["-o", "ControlMaster=auto", "-o", "ControlPersist=600"])
             .arg("-o")
-            .arg(format!("ControlPath={dir}/herdr-bridge-%C"))
+            .arg(format!("ControlPath={}/herdr-bridge-%C", dir.display()))
             .arg(target)
             .arg(format!("PATH=\"$HOME/.local/bin:$PATH\" exec {}", quoted.join(" ")));
         cmd
@@ -184,10 +201,17 @@ impl HerdrClient {
                 }
             }
         }
-        if let Some(agents) = snap["agents"].as_array_mut() {
-            for agent in agents {
-                let name = agent["agent"].as_str().or(agent["name"].as_str()).unwrap_or("");
-                if let Some(usage) = get_agent_usage(name) {
+        // The usage files are this machine's: a remote one's agents get none rather than ours.
+        if self.ssh.is_none()
+            && let Some(agents) = snap["agents"].as_array_mut()
+        {
+            let names: Vec<String> =
+                agents.iter().map(|a| a["agent"].as_str().or(a["name"].as_str()).unwrap_or("").to_string()).collect();
+            let usages = tokio::task::spawn_blocking(move || names.iter().map(|n| crate::usage::usage_of(n)).collect::<Vec<_>>())
+                .await
+                .unwrap_or_default();
+            for (agent, usage) in agents.iter_mut().zip(usages) {
+                if let Some(usage) = usage {
                     agent["usage"] = usage;
                 }
             }
@@ -274,61 +298,4 @@ impl HerdrClient {
             }
         });
     }
-}
-
-/// Usage and quota metrics for an agent, read from local state or config files.
-fn get_agent_usage(agent_name: &str) -> Option<Value> {
-    let agent_id = match agent_name {
-        "agy" => "gemini",
-        other => other,
-    };
-    let state_dir = std::env::var("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var("HOME")
-                .map(|h| PathBuf::from(h).join(".local/state"))
-                .unwrap_or_else(|_| PathBuf::from("/tmp"))
-        });
-    let usage_file = state_dir.join("omarchy/agents/usage").join(format!("{agent_id}.json"));
-    if let Ok(content) = std::fs::read_to_string(&usage_file) {
-        if let Ok(json) = serde_json::from_str::<Value>(&content) {
-            return Some(json!({
-                "tier_label": json.get("tierLabel"),
-                "limits": json.get("limits").unwrap_or(&Value::Array(vec![])),
-                "today_tokens": json.get("todayTotalTokens"),
-                "today_prompts": json.get("todayPrompts"),
-            }));
-        }
-    }
-
-    if agent_id == "claude" {
-        if let Ok(home) = std::env::var("HOME") {
-            let cred_path = PathBuf::from(home).join(".claude/.credentials.json");
-            if let Ok(content) = std::fs::read_to_string(&cred_path) {
-                if let Ok(json) = serde_json::from_str::<Value>(&content) {
-                    let mut tier = json
-                        .get("claudeAiOauth")
-                        .and_then(|o| o.get("subscriptionType"))
-                        .and_then(|s| s.as_str())
-                        .map(|s| {
-                            let mut c = s.chars();
-                            match c.next() {
-                                None => String::new(),
-                                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-                            }
-                        });
-                    if let Some(rate_tier) = json.get("claudeAiOauth").and_then(|o| o.get("rateLimitTier")).and_then(|s| s.as_str()) {
-                        if rate_tier.contains("max_") {
-                            tier = Some(format!("Max {}", &rate_tier[4..]));
-                        }
-                    }
-                    return Some(json!({
-                        "tier_label": tier,
-                        "limits": [],
-                    }));
-                }
-            }
-        }
-    }
-    None
 }

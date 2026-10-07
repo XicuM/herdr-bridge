@@ -1,5 +1,7 @@
 mod herdr;
 mod server;
+mod token;
+mod usage;
 
 use clap::Parser;
 use herdr::HerdrClient;
@@ -25,6 +27,22 @@ struct Args {
     /// Port to listen on
     #[arg(short, long, env = "HERDR_BRIDGE_PORT", default_value_t = 7788)]
     port: u16,
+
+    /// The file holding the token the app must send, made on first start if missing.
+    #[arg(long, env = "HERDR_BRIDGE_TOKEN_FILE", default_value_os_t = default_token_path())]
+    token_file: PathBuf,
+
+    /// Print the token (making it if needed) and exit, to type it into the app.
+    #[arg(long)]
+    print_token: bool,
+}
+
+fn default_token_path() -> PathBuf {
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .unwrap_or_else(|| PathBuf::from(".config"));
+    config.join("herdr-bridge/token")
 }
 
 fn default_socket_path() -> PathBuf {
@@ -48,9 +66,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
+    let token = token::load_or_create(&args.token_file)?;
+    if args.print_token {
+        println!("{token}");
+        return Ok(());
+    }
 
     info!("Starting Herdr Mobile Bridge v{}", env!("CARGO_PKG_VERSION"));
     info!("Targeting Herdr Unix Socket at {:?}", args.socket);
+    info!("The app must send the token in {:?} (herdr-bridge --print-token shows it)", args.token_file);
 
     let herdr = Arc::new(HerdrClient::new(args.socket));
 
@@ -62,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         snapshots: server::start_snapshot_poller(herdr.clone()),
     };
 
-    let app = create_router(state);
+    let app = create_router(state, token);
 
     // An IPv6 bind needs no brackets this way.
     let addr = SocketAddr::new(args.bind.parse::<IpAddr>()?, args.port);

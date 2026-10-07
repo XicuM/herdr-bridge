@@ -54,6 +54,8 @@ fi
 # 3. Connection instructions for mobile
 TAILSCALE_IP=$(tailscale ip -4 2>/dev/null | head -n1 || true)
 PORT="${HERDR_BRIDGE_PORT:-7788}"
+# Made on first start if missing; the app sends it with every request.
+TOKEN=$("$BIN_DIR/herdr-bridge" --print-token)
 echo ""
 echo "=================================================="
 echo " Herdr Bridge is now running in the background!"
@@ -65,4 +67,6 @@ else
   echo " Port         : $PORT"
   echo " Tailscale was not detected. Enter your host IP:$PORT in the mobile app."
 fi
+echo " Token        : $TOKEN"
+echo "   (herdr-bridge --print-token shows it again)"
 echo "=================================================="

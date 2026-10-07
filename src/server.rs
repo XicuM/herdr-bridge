@@ -42,18 +42,24 @@ struct Machines {
     remote: Arc<Mutex<HashMap<String, AppState>>>,
 }
 
-pub fn create_router(local: AppState) -> Router {
+pub fn create_router(local: AppState, token: String) -> Router {
     let machines = Machines { local, remote: Default::default() };
     // The routes see one machine's [AppState]; the machine is picked, and its `/m/<id>` prefix cut,
-    // before they route.
+    // before they route. A request is checked first (the last layer runs first), so one refused never
+    // reaches a machine: picking a remote one connects to it.
     Router::new()
         .fallback_service(routes())
         .layer(middleware::from_fn_with_state(machines, pick_machine))
+        .layer(middleware::from_fn_with_state(Arc::new(token), require_token))
+        .layer(middleware::from_fn(reject_browsers))
+        .layer(TraceLayer::new_for_http())
 }
 
 fn routes() -> Router {
     Router::new()
         .route("/health", get(health_check))
+        // Answers once past [require_token]: how the app tells a wrong token from a bridge that's down.
+        .route("/api/auth", get(|| async { Json(json!({})) }))
         .route("/api/machines", get(get_machines).post(post_machine))
         .route("/api/machines/{id}", delete(delete_machine).post(post_machine_edit))
         .route("/api/snapshot", get(get_snapshot))
@@ -70,8 +76,6 @@ fn routes() -> Router {
         .route("/api/worktree/open", pass("worktree.open"))
         .route("/ws/session", get(ws_session_handler))
         .route("/ws/term/{id}", get(ws_term_handler))
-        .layer(middleware::from_fn(reject_browsers))
-        .layer(TraceLayer::new_for_http())
 }
 
 async fn pick_machine(State(machines): State<Machines>, mut req: Request, next: Next) -> Response {
@@ -206,6 +210,17 @@ async fn reject_browsers(req: Request, next: Next) -> Response {
             return (StatusCode::FORBIDDEN, "herdr-bridge only answers to an IP address or a MagicDNS name")
                 .into_response();
         }
+    }
+    next.run(req).await
+}
+
+/// Every request but `/health` carries the bridge's token ([crate::token]) as `Authorization: Bearer`.
+async fn require_token(State(token): State<Arc<String>>, req: Request, next: Next) -> Response {
+    let given = req.headers().get(header::AUTHORIZATION).and_then(|h| h.to_str().ok()).and_then(|h| h.strip_prefix("Bearer "));
+    if req.uri().path() != "/health" && !given.is_some_and(|g| crate::token::matches(&token, g)) {
+        warn!("Refused a request to {} without the right token", req.uri().path());
+        return (StatusCode::UNAUTHORIZED, "Wrong or missing token: run herdr-bridge --print-token on that machine")
+            .into_response();
     }
     next.run(req).await
 }
