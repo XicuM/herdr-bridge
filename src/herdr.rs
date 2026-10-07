@@ -184,6 +184,14 @@ impl HerdrClient {
                 }
             }
         }
+        if let Some(agents) = snap["agents"].as_array_mut() {
+            for agent in agents {
+                let name = agent["agent"].as_str().or(agent["name"].as_str()).unwrap_or("");
+                if let Some(usage) = get_agent_usage(name) {
+                    agent["usage"] = usage;
+                }
+            }
+        }
         let panes = snap["panes"].as_array().cloned().unwrap_or_default();
         let Some(workspaces) = snap["workspaces"].as_array_mut() else { return Ok(res) };
 
@@ -208,14 +216,6 @@ impl HerdrClient {
         let mut cmd = self.command("sh", &args);
         cmd.kill_on_drop(true);
         let Ok(Ok(out)) = tokio::time::timeout(Duration::from_secs(10), cmd.output()).await else { return Ok(res) };
-        if let Some(agents) = snap["agents"].as_array_mut() {
-            for agent in agents {
-                let name = agent["agent"].as_str().or(agent["name"].as_str()).unwrap_or("");
-                if let Some(usage) = get_agent_usage(name) {
-                    agent["usage"] = usage;
-                }
-            }
-        }
         for (ws, branch) in workspaces.iter_mut().zip(String::from_utf8_lossy(&out.stdout).lines()) {
             if !branch.trim().is_empty() {
                 ws["git_branch"] = Value::String(branch.trim().to_string());
