@@ -214,11 +214,17 @@ async fn reject_browsers(req: Request, next: Next) -> Response {
     next.run(req).await
 }
 
+/// Held for a second by each refused request, so wrong tokens are answered one a second however many
+/// come at once: guessing the token's ~40 bits would take thousands of years.
+static REFUSALS: Mutex<()> = Mutex::const_new(());
+
 /// Every request but `/health` carries the bridge's token ([crate::token]) as `Authorization: Bearer`.
 async fn require_token(State(token): State<Arc<String>>, req: Request, next: Next) -> Response {
     let given = req.headers().get(header::AUTHORIZATION).and_then(|h| h.to_str().ok()).and_then(|h| h.strip_prefix("Bearer "));
     if req.uri().path() != "/health" && !given.is_some_and(|g| crate::token::matches(&token, g)) {
         warn!("Refused a request to {} without the right token", req.uri().path());
+        let _turn = REFUSALS.lock().await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
         return (StatusCode::UNAUTHORIZED, "Wrong or missing token: run herdr-bridge --print-token on that machine")
             .into_response();
     }

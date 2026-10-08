@@ -7,8 +7,8 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
-/// No 0/o/1/l/i, so it can be read off a screen and typed on a phone.
-const ALPHABET: &[u8] = b"23456789abcdefghjkmnpqrstuvwxyz";
+/// No 0/O/1/L/I, so it can be read off a screen and typed on a phone.
+const ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
 
 /// The token in [path], made (readable by this user only) when there is none. One that others can read
 /// is refused, since anyone who can read it can use the bridge.
@@ -18,26 +18,27 @@ pub fn load_or_create(path: &Path) -> Result<String, Box<dyn std::error::Error>>
             return Err(format!("{path:?} can be read by other users; run chmod 600 on it").into());
         }
         let token = fs::read_to_string(path)?.trim().to_string();
-        if token.len() < 16 {
-            return Err(format!("the token in {path:?} is shorter than 16 characters").into());
+        if token.len() < 8 {
+            return Err(format!("the token in {path:?} is shorter than 8 characters").into());
         }
         return Ok(token);
     }
     if let Some(dir) = path.parent() {
         fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
     }
-    // 24 characters of 31: about 119 bits. Rejection sampling keeps every character equally likely.
+    // 8 characters of 31: about 40 bits, enough as the server answers one wrong token a second.
+    // Rejection sampling keeps every character equally likely.
     let mut random = fs::File::open("/dev/urandom")?;
     let mut chars = Vec::new();
     let mut byte = [0u8];
-    while chars.len() < 24 {
+    while chars.len() < 8 {
         random.read_exact(&mut byte)?;
         if (byte[0] as usize) < 256 - 256 % ALPHABET.len() {
             chars.push(ALPHABET[byte[0] as usize % ALPHABET.len()]);
         }
     }
-    // In groups of six, e.g. `k3mf9q-…`, to type it.
-    let token = chars.chunks(6).map(|c| String::from_utf8_lossy(c).into_owned()).collect::<Vec<_>>().join("-");
+    // In groups of four, e.g. `K3MF-9QXA`, to type it.
+    let token = chars.chunks(4).map(|c| String::from_utf8_lossy(c).into_owned()).collect::<Vec<_>>().join("-");
     // Written aside and linked into place, so a bridge starting at the same time (the service, and
     // `--print-token` from install.sh) never reads half a token, and the first one made wins.
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
