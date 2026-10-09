@@ -65,13 +65,13 @@ impl HerdrClient {
     pub async fn machine_error(&self, error: String) -> String {
         let Some(id) = &self.machine else { return error };
         let Ok(out) = Command::new("herdr").args(["--machine", id, "api", "snapshot"]).output().await else {
-            return "Error".into();
+            return error;
         };
         // herdr prints `Error: Custom { kind: Other, error: "<message>" }`.
         let text = String::from_utf8_lossy(&out.stderr);
         let text = text.trim();
         if text.is_empty() {
-            return "Error".into();
+            return error;
         }
         let message = text.split_once("error: \"").and_then(|(_, m)| m.rsplit_once('"')).map_or(text, |(m, _)| m);
         // herdr's message leads with "machine '<label>'", maybe with " (session <name>)", and ": ".
@@ -111,6 +111,11 @@ impl HerdrClient {
         cmd
     }
 
+    /// For the logs: the SSH target it reaches, or "this machine".
+    pub fn name(&self) -> &str {
+        self.ssh.as_deref().unwrap_or("this machine")
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<Value> {
         self.event_tx.subscribe()
     }
@@ -120,7 +125,12 @@ impl HerdrClient {
         let (reader, mut writer, ssh): Conn = if self.ssh.is_none() {
             let (reader, writer) = UnixStream::connect(&self.socket_path)
                 .await
-                .map_err(|e| format!("Failed to connect to herdr socket at {:?}: {}", self.socket_path, e))?
+                .map_err(|e| match e.kind() {
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
+                        format!("herdr isn't running on this machine (nothing at {:?}): start it", self.socket_path)
+                    }
+                    _ => format!("Failed to connect to herdr socket at {:?}: {}", self.socket_path, e),
+                })?
                 .into_split();
             (Box::new(reader), Box::new(writer), None)
         } else {

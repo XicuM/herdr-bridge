@@ -366,7 +366,13 @@ pub fn start_snapshot_poller(herdr: Arc<HerdrClient>) -> Arc<watch::Sender<Utf8B
             if tx.receiver_count() == 0 {
                 continue;
             }
-            let text = snapshot_message(&herdr).await.unwrap_or_else(|e| error_message(&e));
+            let text = snapshot_message(&herdr).await.unwrap_or_else(|e| {
+                let text = error_message(&e);
+                if *tx.borrow() != text {
+                    warn!("No snapshot from {}: {e}", herdr.name());
+                }
+                text
+            });
             tx.send_if_modified(|last| {
                 let changed = *last != text;
                 *last = text;
