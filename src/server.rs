@@ -482,8 +482,21 @@ async fn handle_ws_term(mut socket: WebSocket, herdr: &HerdrClient, pane_id: Str
     });
 
     let (mut sender, mut receiver) = socket.split();
+    // A phone that vanished (out of signal) never closes its socket, and TCP takes many minutes to notice,
+    // all the while holding the pane at the phone's size on the desktop. Every client answers pings, so one
+    // not heard from in 30 s is gone. A frame that can't be sent in 20 s means the same: a dead peer's full
+    // buffer would otherwise block the loop, pings included.
+    let mut ping = tokio::time::interval(Duration::from_secs(10));
+    let mut heard = tokio::time::Instant::now();
     loop {
         tokio::select! {
+            _ = ping.tick() => {
+                if heard.elapsed() > Duration::from_secs(30)
+                    || !matches!(tokio::time::timeout(Duration::from_secs(20), sender.send(Message::Ping(Default::default()))).await, Ok(Ok(())))
+                {
+                    break;
+                }
+            }
             line = frames.next_line() => {
                 // On a read error too, fall through to the release below.
                 let Ok(Some(line)) = line else {
@@ -505,12 +518,13 @@ async fn handle_ws_term(mut socket: WebSocket, herdr: &HerdrClient, pane_id: Str
                     break;
                 }
                 if let Some(bytes) = frame["bytes"].as_str().and_then(|b| BASE64.decode(b).ok())
-                    && sender.send(Message::Binary(bytes.into())).await.is_err()
+                    && !matches!(tokio::time::timeout(Duration::from_secs(20), sender.send(Message::Binary(bytes.into()))).await, Ok(Ok(())))
                 {
                     break;
                 }
             }
             msg = receiver.next() => {
+                heard = tokio::time::Instant::now();
                 let cmd = match msg {
                     Some(Ok(Message::Binary(bytes))) => json!({ "type": "terminal.input", "bytes": BASE64.encode(&bytes) }),
                     Some(Ok(Message::Text(text))) => match serde_json::from_str::<Value>(&text) {
