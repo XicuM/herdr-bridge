@@ -456,7 +456,13 @@ fn antigravity_probe(home: &Path) -> Vec<Value> {
         for g in groups {
             let g_name = g["name"].as_str().unwrap_or("");
             if let Some(buckets) = g["buckets"].as_array() {
-                for b in buckets {
+                let mut buckets = buckets.clone();
+                buckets.sort_by_key(|b| match b["window"].as_str() {
+                    Some("5h") => 0,
+                    Some("weekly") => 1,
+                    _ => 2,
+                });
+                for b in &buckets {
                     let rem = b["remaining_fraction"].as_f64().unwrap_or(1.0);
                     let used = (1.0 - rem).clamp(0.0, 1.0);
                     let window = b["window"].as_str().unwrap_or("");
