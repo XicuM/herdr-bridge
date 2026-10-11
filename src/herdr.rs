@@ -229,18 +229,31 @@ impl HerdrClient {
         let panes = snap["panes"].as_array().cloned().unwrap_or_default();
         let Some(workspaces) = snap["workspaces"].as_array_mut() else { return Ok(res) };
 
-        // A workspace's directory: its worktree checkout, else the focused pane of its active tab.
+        // A workspace's directory: the focused pane of its active tab, else its worktree checkout.
         let dirs: Vec<Option<String>> = workspaces
             .iter()
             .map(|ws| {
-                if let Some(path) = ws["worktree"]["checkout_path"].as_str() {
-                    return Some(path.to_string());
-                }
                 let tab_panes: Vec<&Value> = panes.iter().filter(|p| p["tab_id"] == ws["active_tab_id"]).collect();
-                let pane = tab_panes.iter().find(|p| p["focused"] == true).or(tab_panes.first())?;
-                pane["foreground_cwd"].as_str().or(pane["cwd"].as_str()).map(String::from)
+                let pane = tab_panes.iter().find(|p| p["focused"] == true).or(tab_panes.first());
+                pane.and_then(|p| p["foreground_cwd"].as_str().or(p["cwd"].as_str()))
+                    .map(String::from)
+                    .or_else(|| ws["worktree"]["checkout_path"].as_str().map(String::from))
             })
             .collect();
+
+        // If a non-linked workspace inherited a stale worktree whose repo does not match the
+        // pane's directory, drop it so the workspace is not tied to an unrelated repository.
+        for (ws, dir) in workspaces.iter_mut().zip(&dirs) {
+            if let Some(dir) = dir
+                && let Some(wt) = ws.get_mut("worktree")
+                && wt["is_linked_worktree"] != true
+            {
+                let root = wt["repo_root"].as_str().or(wt["checkout_path"].as_str()).unwrap_or("");
+                if !root.is_empty() && dir != root && !dir.starts_with(&format!("{root}/")) {
+                    ws.as_object_mut().map(|obj| obj.remove("worktree"));
+                }
+            }
+        }
 
         // One command for every workspace, one line each (empty without a branch): on a remote machine it
         // is one SSH round trip.
