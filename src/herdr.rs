@@ -116,6 +116,67 @@ impl HerdrClient {
         self.ssh.as_deref().unwrap_or("this machine")
     }
 
+    /// Whether this machine is reached over SSH rather than being this one.
+    pub fn is_remote(&self) -> bool {
+        self.ssh.is_some()
+    }
+
+    /// Saves an uploaded image where this machine's agents run and answers its absolute path: here
+    /// in the uploads dir, or there over SSH (which streams the bytes into the same dir). `name`
+    /// comes from [crate::uploads::file_name], safe characters only, and is checked again.
+    pub async fn save_upload(&self, name: &str, bytes: &[u8]) -> Result<String, String> {
+        if name.is_empty()
+            || name.contains("..")
+            || !name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        {
+            return Err("Invalid upload name".into());
+        }
+        if self.ssh.is_none() {
+            let dir = crate::uploads::dir();
+            let path = dir.join(name);
+            tokio::fs::write(&path, bytes).await.map_err(|e| format!("Could not save the image: {e}"))?;
+            use std::os::unix::fs::PermissionsExt;
+            let _ = tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await;
+            crate::uploads::prune(dir);
+            return Ok(path.to_string_lossy().into_owned());
+        }
+        // The remote shell parses the command line, and `command` quotes every argument; the names
+        // this bridge makes carry no newlines, so `ls` lines are file names. The script prints the
+        // path it saved, since the remote `$HOME` is only known there.
+        let script = format!(
+            "d=\"$HOME/.cache/herdr-bridge/uploads\"; mkdir -p \"$d\" && cat > \"$d/{name}\" && chmod 600 \"$d/{name}\" && cd \"$d\" && ls -t | tail -n +101 | xargs -r rm -f && echo \"$d/{name}\""
+        );
+        let mut child = self
+            .command("sh", &["-c", &script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| format!("Failed to reach {} over SSH: {e}", self.name()))?;
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        let wrote = tokio::time::timeout(Duration::from_secs(60), async {
+            stdin.write_all(bytes).await?;
+            drop(stdin);
+            let out = child.wait_with_output().await?;
+            if !out.status.success() {
+                return Err::<Vec<u8>, std::io::Error>(std::io::Error::other(
+                    String::from_utf8_lossy(&out.stderr).trim().lines().last().unwrap_or("ssh failed").to_string(),
+                ));
+            }
+            Ok(out.stdout)
+        })
+        .await
+        .map_err(|_| "Timed out saving the image over SSH".to_string())?
+        .map_err(|e| e.to_string())?;
+        let path = String::from_utf8_lossy(&wrote);
+        let path = path.trim();
+        if path.is_empty() {
+            return Err(format!("{} saved nothing", self.name()));
+        }
+        Ok(path.into())
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<Value> {
         self.event_tx.subscribe()
     }

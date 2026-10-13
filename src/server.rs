@@ -2,7 +2,7 @@ use crate::herdr::HerdrClient;
 use axum::{
     extract::{
         ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
-        Extension, Path, Query, Request, State,
+        DefaultBodyLimit, Extension, Path, Query, Request, State,
     },
     http::{header, StatusCode},
     middleware::{self, Next},
@@ -74,6 +74,7 @@ fn routes() -> Router {
         .route("/api/workspace/{id}/rename", post(post_workspace_rename))
         .route("/api/worktree", pass("worktree.create").get(get_worktree_list))
         .route("/api/worktree/open", pass("worktree.open"))
+        .route("/api/uploads", post(post_upload).route_layer(DefaultBodyLimit::disable()))
         .route("/ws/session", get(ws_session_handler))
         .route("/ws/term/{id}", get(ws_term_handler))
 }
@@ -247,6 +248,33 @@ async fn get_snapshot(Extension(state): Extension<AppState>) -> Result<Json<Valu
 }
 
 type ApiResult = Result<Json<Value>, (StatusCode, String)>;
+
+/// Saves a posted image where the machine's agents run and answers its path, to put after `@`.
+/// The bytes travel as base64 so the route stays JSON like the others; the 2 MB JSON default is
+/// lifted for this route, and [crate::uploads::MAX_BYTES] caps it instead. Only image data with a
+/// matching magic is stored.
+async fn post_upload(Extension(state): Extension<AppState>, Json(up): Json<UploadImage>) -> ApiResult {
+    let bytes = BASE64.decode(up.data.trim()).map_err(|_| (StatusCode::BAD_REQUEST, "Upload is not valid base64".into()))?;
+    if bytes.is_empty() || bytes.len() > crate::uploads::MAX_BYTES {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, "Image is empty or over 10 MB".into()));
+    }
+    if !crate::uploads::magic_ok(&up.mime, &bytes) {
+        return Err((StatusCode::BAD_REQUEST, "Only PNG, JPEG, GIF or WebP images can be uploaded".into()));
+    }
+    let Some(name) = crate::uploads::file_name(&up.mime) else {
+        return Err((StatusCode::BAD_REQUEST, "Only PNG, JPEG, GIF or WebP images can be uploaded".into()));
+    };
+    let path = state.herdr.save_upload(&name, &bytes).await.map_err(|e| {
+        if state.herdr.is_remote() { (StatusCode::BAD_GATEWAY, e) } else { (StatusCode::INTERNAL_SERVER_ERROR, e) }
+    })?;
+    Ok(Json(json!({ "path": path })))
+}
+
+#[derive(Deserialize)]
+struct UploadImage {
+    mime: String,
+    data: String,
+}
 
 /// A POST whose JSON body goes straight to herdr as `method`'s params, e.g. `tab.move` (`tab_id`,
 /// `insert_index`: the tab goes in front of the one at that index in its workspace's order before the

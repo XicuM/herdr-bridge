@@ -2,6 +2,7 @@ mod herdr;
 mod monitors;
 mod server;
 mod token;
+mod uploads;
 mod usage;
 
 use clap::Parser;
