@@ -1,4 +1,5 @@
 mod herdr;
+mod monitors;
 mod server;
 mod token;
 mod usage;

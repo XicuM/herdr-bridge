@@ -212,19 +212,21 @@ impl HerdrClient {
             }
         }
         // The usage files are this machine's: a remote one's agents get none rather than ours.
-        if self.ssh.is_none()
-            && let Some(agents) = snap["agents"].as_array_mut()
-        {
-            let names: Vec<String> =
-                agents.iter().map(|a| a["agent"].as_str().or(a["name"].as_str()).unwrap_or("").to_string()).collect();
-            let usages = tokio::task::spawn_blocking(move || names.iter().map(|n| crate::usage::usage_of(n)).collect::<Vec<_>>())
-                .await
-                .unwrap_or_default();
-            for (agent, usage) in agents.iter_mut().zip(usages) {
-                if let Some(usage) = usage {
-                    agent["usage"] = usage;
+        // So are the background monitors, read from this machine's `/proc`.
+        if self.ssh.is_none() {
+            if let Some(agents) = snap["agents"].as_array_mut() {
+                let names: Vec<String> =
+                    agents.iter().map(|a| a["agent"].as_str().or(a["name"].as_str()).unwrap_or("").to_string()).collect();
+                let usages = tokio::task::spawn_blocking(move || names.iter().map(|n| crate::usage::usage_of(n)).collect::<Vec<_>>())
+                    .await
+                    .unwrap_or_default();
+                for (agent, usage) in agents.iter_mut().zip(usages) {
+                    if let Some(usage) = usage {
+                        agent["usage"] = usage;
+                    }
                 }
             }
+            crate::monitors::mark(self, snap).await;
         }
         let panes = snap["panes"].as_array().cloned().unwrap_or_default();
         let Some(workspaces) = snap["workspaces"].as_array_mut() else { return Ok(res) };
