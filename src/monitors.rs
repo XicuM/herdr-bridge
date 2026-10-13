@@ -5,7 +5,9 @@
 //! watch loops, long `scons` runs, user-backgrounded jobs) are still working.
 //! Everything running in a pane is a descendant of its shell, so one `/proc`
 //! walk per snapshot finds them for every agent alike: anything left after
-//! filtering out the agent itself and known wrappers (MCP servers) counts.
+//! filtering out the agent itself and known wrappers (MCP servers, language
+//! servers an editor integration keeps running for diagnostics/completion)
+//! counts.
 //!
 //! Local machine only (like `usage`): over SSH the walk would have to run
 //! there. Results are cached 10 s; pane→shell pids 60 s (ids are reused).
@@ -150,9 +152,11 @@ fn has_monitors(procs: &HashMap<u32, Proc>, shell: u32, agent: &str) -> bool {
     false
 }
 
-/// The agent binary itself, MCP servers (`… mcp …`), and the JS runtimes they
-/// are near-universally run with. A node-based monitor is missed by this;
-/// wrongly calling every MCP pane "monitoring" would be worse.
+/// The agent binary itself, MCP servers (`… mcp …`), the JS runtimes they are
+/// near-universally run with, and language servers: coding agents routinely
+/// keep one running for diagnostics/completion, and it sits idle between
+/// edits like an MCP server does. A node-based monitor is missed by this;
+/// wrongly calling every MCP or LSP pane "monitoring" would be worse.
 fn is_wrapper(cmdline: &str, agent: &str) -> bool {
     let argv0 = cmdline.split(' ').next().unwrap_or_default();
     let base = argv0.rsplit('/').next().unwrap_or_default().to_lowercase();
@@ -162,7 +166,24 @@ fn is_wrapper(cmdline: &str, agent: &str) -> bool {
     if cmdline.to_lowercase().contains("mcp") {
         return true;
     }
-    matches!(base.as_str(), "node" | "npm" | "npx" | "bun" | "deno")
+    if matches!(base.as_str(), "node" | "npm" | "npx" | "bun" | "deno") {
+        return true;
+    }
+    is_language_server(&base)
+}
+
+/// Common language-server binary names, by suffix where they follow one
+/// (`*-language-server`, `*-langserver`, `*-lsp`, `*-ls`) and by name where
+/// they don't.
+fn is_language_server(base: &str) -> bool {
+    if base.ends_with("-language-server") || base.ends_with("-langserver") || base.ends_with("-lsp") || base.ends_with("-ls")
+    {
+        return true;
+    }
+    matches!(
+        base,
+        "clangd" | "gopls" | "rust-analyzer" | "pylsp" | "solargraph" | "jdtls" | "omnisharp" | "intelephense" | "metals" | "sqls" | "zls"
+    )
 }
 
 /// Every process from `/proc`: pid → parent, state, and command line.
@@ -246,6 +267,16 @@ mod tests {
         assert!(is_wrapper("node /home/xicu/Projects/overleaf-suggest/dist/index.js serve", "agy"));
         assert!(!is_wrapper("/usr/bin/python /home/xicu/bin/scons cocotb", "claude"));
         assert!(!is_wrapper("timeout 1500 scons cocotb TOP=tmu_top", "claude"));
+    }
+
+    #[test]
+    fn language_servers_are_wrappers() {
+        assert!(is_wrapper("clangd --background-index", "claude"));
+        assert!(is_wrapper("/usr/bin/rust-analyzer", "claude"));
+        assert!(is_wrapper("typescript-language-server --stdio", "claude"));
+        assert!(is_wrapper("pyright-langserver --stdio", "claude"));
+        assert!(is_wrapper("sourcekit-lsp", "claude"));
+        assert!(!is_wrapper("/usr/bin/python /home/xicu/bin/scons cocotb", "claude"));
     }
 
     #[test]
