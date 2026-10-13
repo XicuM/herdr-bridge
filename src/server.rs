@@ -454,6 +454,15 @@ async fn handle_ws_session(socket: WebSocket, state: AppState) {
 struct TermSize {
     cols: u16,
     rows: u16,
+    /// Explicit opt-in to steal the pane from another attached client
+    /// (`?takeover=1`). Without it herdr refuses when one holds the pane,
+    /// so two viewers never fight over it and flicker `terminal attach
+    /// taken over` at each other.
+    takeover: Option<String>,
+}
+
+fn wants_takeover(takeover: &Option<String>) -> bool {
+    matches!(takeover.as_deref(), Some("1") | Some("true"))
 }
 
 async fn ws_term_handler(
@@ -482,11 +491,20 @@ async fn ws_term_handler(
 /// Streams one pane through `herdr terminal session control`, which sizes the pane to the viewer
 /// and emits server-rendered ANSI frames. Binary frames carry terminal output/input; text frames
 /// carry typed control commands (e.g. `terminal.scroll`), or else `{"cols","rows"}` resizes.
-/// Herdr's errors (no such pane, no `herdr` on PATH) are written into the terminal, so the app shows why.
+/// Herdr's errors (no such pane, no `herdr` on PATH) are written into the terminal, so the app shows why;
+/// a `terminal.closed` reason is also sent as a `{"type":"term-closed","reason":…}` text frame first,
+/// so the app can tell "another client holds this pane" from other failures.
+/// The pane is only taken over from another client with `?takeover=1`; otherwise herdr refuses
+/// while one holds it, and the desktop keeps its size.
 async fn handle_ws_term(mut socket: WebSocket, herdr: &HerdrClient, pane_id: String, size: TermSize) -> std::io::Result<()> {
     let (cols, rows) = (size.cols.to_string(), size.rows.to_string());
+    let mut args = vec!["terminal", "session", "control", &pane_id];
+    if wants_takeover(&size.takeover) {
+        args.push("--takeover");
+    }
+    args.extend(["--cols", &cols, "--rows", &rows]);
     let spawned = herdr
-        .command("herdr", &["terminal", "session", "control", &pane_id, "--takeover", "--cols", &cols, "--rows", &rows])
+        .command("herdr", &args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -539,8 +557,11 @@ async fn handle_ws_term(mut socket: WebSocket, herdr: &HerdrClient, pane_id: Str
                 };
                 let Ok(frame) = serde_json::from_str::<Value>(&line) else { continue };
                 if frame["type"] == "terminal.closed" {
-                    // E.g. "terminal target w1:p9 not found".
+                    // E.g. "terminal target w1:p9 not found", or that another client holds the pane.
                     if let Some(reason) = frame["reason"].as_str() {
+                        let _ = sender
+                            .send(Message::Text(json!({ "type": "term-closed", "reason": reason }).to_string().into()))
+                            .await;
                         let _ = sender.send(Message::Binary(format!("\r\n{reason}\r\n").into_bytes().into())).await;
                     }
                     break;
