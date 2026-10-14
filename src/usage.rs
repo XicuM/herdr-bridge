@@ -436,6 +436,7 @@ fn antigravity(home: &Path) -> Option<Value> {
     {
         limits = arr.clone();
     }
+    tag_antigravity_limits(&mut limits);
 
     if tokens == 0 && prompts == 0 && limits.is_empty() {
         return None;
@@ -467,29 +468,53 @@ fn antigravity_probe(home: &Path) -> Vec<Value> {
                     let used = (1.0 - rem).clamp(0.0, 1.0);
                     let window = b["window"].as_str().unwrap_or("");
                     let reset = b["reset_time"].as_str();
+                    let bucket_name = b["name"].as_str().unwrap_or("Limit");
                     let label = if g_name == "Gemini Models" {
                         if window == "5h" {
                             "Session (5-hour)".to_string()
                         } else if window == "weekly" {
                             "Weekly (7-day)".to_string()
                         } else {
-                            b["name"].as_str().unwrap_or("Limit").to_string()
+                            bucket_name.to_string()
                         }
                     } else if !g_name.is_empty() {
-                        format!("{} {}", g_name, b["name"].as_str().unwrap_or("Limit"))
+                        format!("{} {}", g_name, bucket_name)
                     } else {
-                        b["name"].as_str().unwrap_or("Limit").to_string()
+                        bucket_name.to_string()
                     };
+                    let primary = !antigravity_is_secondary(&format!("{g_name} {bucket_name}"));
                     limits.push(json!({
                         "label": label,
                         "percent": (used * 100.0).round() / 100.0,
                         "resets_at": reset,
+                        "primary": primary,
                     }));
                 }
             }
         }
     }
     limits
+}
+
+/// A non-Gemini Antigravity bucket (the Claude / GPT tiers sharing the plan):
+/// shown in the usage sheet but kept out of the headline quota percentage.
+fn antigravity_is_secondary(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    ["claude", "anthropic", "gpt", "openai", "codex"]
+        .iter()
+        .any(|m| lower.contains(m))
+}
+
+/// Backfill the `primary` flag on limits that lack it (cached limits from
+/// older bridges or usage writers): secondary tiers are still shown, just not
+/// counted towards the headline percentage.
+fn tag_antigravity_limits(limits: &mut Vec<Value>) {
+    for limit in limits.iter_mut() {
+        if limit.get("primary").is_none() {
+            let label = limit.get("label").and_then(|v| v.as_str()).unwrap_or("");
+            limit["primary"] = (!antigravity_is_secondary(label)).into();
+        }
+    }
 }
 
 /// xAI Grok: live billing API, local session stats, settings cache, and usage files.
@@ -1051,6 +1076,35 @@ mod tests {
         ]);
         let got = antigravity(&home).unwrap();
         assert_eq!(got["tier_label"], "Claude 3.7 Sonnet (Thinking)");
+    }
+
+    #[test]
+    fn antigravity_tags_secondary_tiers_but_keeps_them() {
+        assert!(!antigravity_is_secondary("Gemini Models Session"));
+        assert!(!antigravity_is_secondary("Session (5-hour)"));
+        assert!(antigravity_is_secondary("Claude Models Session"));
+        assert!(antigravity_is_secondary("GPT Models Weekly"));
+        assert!(antigravity_is_secondary("OpenAI Codex 5h"));
+
+        // Cached limits from older bridges lack `primary`: backfill from label.
+        let home = home("antigravity-secondary");
+        let path = home.join(".cache/ai-usagebar/antigravity/usage.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, json!({
+            "limits": [
+                {"label": "Session (5-hour)", "percent": 0.4},
+                {"label": "Weekly (7-day)", "percent": 0.3},
+                {"label": "Claude Models Session", "percent": 1.0},
+                {"label": "GPT Models Weekly", "percent": 1.0},
+            ]
+        }).to_string()).unwrap();
+        let got = antigravity(&home).unwrap();
+        let limits = got["limits"].as_array().unwrap();
+        assert_eq!(limits.len(), 4);
+        assert_eq!(limits[0]["primary"], true);
+        assert_eq!(limits[1]["primary"], true);
+        assert_eq!(limits[2]["primary"], false);
+        assert_eq!(limits[3]["primary"], false);
     }
 
     #[test]
