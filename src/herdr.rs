@@ -59,25 +59,23 @@ impl HerdrClient {
         Self { ssh: Some(ssh), machine: Some(id), session, ..Self::new("") }
     }
 
-    /// Why herdr can't reach this machine either, as `herdr --machine` puts it (e.g. "remote Herdr does
-    /// not support machine API forwarding; update Herdr on this machine"), or just "Error" when herdr
-    /// can. This machine's own failure is the bridge's [error], since herdr has nothing to add.
+    /// Why herdr can't reach this machine either, as `herdr machine status` puts it (e.g. "remote Herdr
+    /// server is stopped or incompatible; run …"), or [error] when herdr can. This machine's own failure
+    /// is the bridge's [error], since herdr has nothing to add.
     pub async fn machine_error(&self, error: String) -> String {
         let Some(id) = &self.machine else { return error };
-        let Ok(out) = Command::new("herdr").args(["--machine", id, "api", "snapshot"]).output().await else {
+        let Ok(out) = Command::new("herdr").args(["machine", "status", id, "--json"]).output().await else {
             return error;
         };
-        // herdr prints `Error: Custom { kind: Other, error: "<message>" }`.
-        let text = String::from_utf8_lossy(&out.stderr);
-        let text = text.trim();
-        if text.is_empty() {
-            return error;
-        }
-        let message = text.split_once("error: \"").and_then(|(_, m)| m.rsplit_once('"')).map_or(text, |(m, _)| m);
-        // herdr's message leads with "machine '<label>'", maybe with " (session <name>)", and ": ".
-        match message.strip_prefix("machine '").and_then(|m| m.split_once(": ")) {
-            Some((_, m)) => m.to_string(),
-            None => message.to_string(),
+        let rows: Vec<Value> = serde_json::from_slice(&out.stdout).unwrap_or_default();
+        let Some(row) = rows.first() else { return error };
+        match (row["status"].as_str(), row["error"].as_str()) {
+            // SSH wants a password or MFA, which only a terminal can give.
+            (Some("auth required"), Some(e)) => {
+                format!("{e}\nRun `herdr machine reconnect {}` on the bridge's machine.", row["label"].as_str().unwrap_or(id))
+            }
+            (_, Some(e)) => e.to_string(),
+            _ => error,
         }
     }
 

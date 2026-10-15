@@ -67,6 +67,7 @@ fn routes() -> Router {
         .route("/api/tab/move", pass("tab.move"))
         .route("/api/tab/{id}", delete(delete_tab))
         .route("/api/tab/{id}/rename", post(post_tab_rename))
+        .route("/api/pane/clear", pass("pane.clear"))
         .route("/api/pane/{id}", delete(delete_pane))
         .route("/api/workspace", pass("workspace.create"))
         .route("/api/workspace/move", pass("workspace.move_block"))
