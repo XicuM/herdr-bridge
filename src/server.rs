@@ -300,6 +300,7 @@ async fn delete_pane(Extension(state): Extension<AppState>, Path(pane_id): Path<
 struct WorkspaceDeleteQuery {
     remove_worktree: Option<bool>,
     force: Option<bool>,
+    close_group: Option<bool>,
 }
 
 async fn delete_workspace(
@@ -311,6 +312,9 @@ async fn delete_workspace(
     let mut params = json!({ "workspace_id": workspace_id });
     if let Some(force) = query.force {
         params["force"] = json!(force);
+    }
+    if let Some(close_group) = query.close_group {
+        params["close_group"] = json!(close_group);
     }
     rpc(&state, method, params).await
 }

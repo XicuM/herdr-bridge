@@ -344,10 +344,12 @@ impl HerdrClient {
                     None => info!("Connecting event subscriber to herdr socket at {:?}", self.socket_path),
                 }
                 let subscriptions: Vec<Value> = [
-                    "workspace.created", "workspace.updated", "workspace.focused", "workspace.closed",
-                    "tab.created", "tab.focused", "tab.closed",
-                    "pane.created", "pane.focused", "pane.closed", "pane.updated", "pane.agent_detected",
-                    "layout.updated",
+                    "workspace.created", "workspace.updated", "workspace.renamed", "workspace.moved",
+                    "workspace.reordered", "workspace.focused", "workspace.closed",
+                    "worktree.created", "worktree.opened", "worktree.removed",
+                    "tab.created", "tab.renamed", "tab.moved", "tab.focused", "tab.closed",
+                    "pane.created", "pane.focused", "pane.closed", "pane.updated", "pane.moved", "pane.exited",
+                    "pane.agent_detected", "layout.updated",
                 ]
                 .iter()
                 .map(|t| json!({ "type": t }))
@@ -355,25 +357,31 @@ impl HerdrClient {
                 match self.send("bridge-sub-all", "events.subscribe", json!({ "subscriptions": subscriptions })).await {
                     Ok((reader, writer, ssh)) => {
                         let mut lines = BufReader::new(reader).lines();
-                        let _keep_alive = (writer, ssh);
-
-                        info!("Successfully subscribed to Herdr runtime events");
-                        while let Ok(Some(line)) = lines.next_line().await {
-                            if line.trim().is_empty() {
-                                continue;
-                            }
-                            wait = 3;
-                            match serde_json::from_str::<Value>(&line) {
-                                Ok(val) => {
-                                    let _ = self.event_tx.send(val);
+                        // herdr answers `subscription_started` first; anything else is why it didn't subscribe.
+                        match lines.next_line().await {
+                            Ok(Some(line)) if line.contains("subscription_started") => {
+                                let _keep_alive = (writer, ssh);
+                                info!("Subscribed to herdr's events");
+                                wait = 3;
+                                while let Ok(Some(line)) = lines.next_line().await {
+                                    if line.trim().is_empty() {
+                                        continue;
+                                    }
+                                    match serde_json::from_str::<Value>(&line) {
+                                        Ok(val) => {
+                                            let _ = self.event_tx.send(val);
+                                        }
+                                        Err(e) => {
+                                            warn!("Received unparsable JSON event: {}", e);
+                                            debug!("Unparsable event: {}", line);
+                                        }
+                                    }
                                 }
-                                Err(e) => {
-                                    warn!("Received unparsable JSON event: {}", e);
-                                    debug!("Unparsable event: {}", line);
-                                }
+                                warn!("Herdr event stream closed. Reconnecting in {wait} s...");
                             }
+                            Ok(Some(line)) => error!("herdr refused the event subscription: {line}. Retrying in {wait} s..."),
+                            _ => error!("Failed to subscribe to herdr events: {}. Retrying in {wait} s...", Self::ssh_error(ssh).await),
                         }
-                        warn!("Herdr event stream closed. Reconnecting in {wait} s...");
                     }
                     Err(e) => {
                         error!("Failed to subscribe to herdr events: {}. Retrying in {wait} s...", e);
