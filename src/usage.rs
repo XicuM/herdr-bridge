@@ -296,25 +296,28 @@ fn codex_rpc(home: &Path) -> Option<(Option<String>, Vec<Value>)> {
         .stderr(std::process::Stdio::null());
     let mut child = cmd.spawn().ok()?;
 
-    let mut stdin = child.stdin.take()?;
-    let stdout = child.stdout.take()?;
+    let result = (|| {
+        let mut stdin = child.stdin.take()?;
+        let stdout = child.stdout.take()?;
 
-    let _ = writeln!(stdin, "{}", json!({"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "herdr-bridge", "version": "1"}}}));
-    let _ = writeln!(stdin, "{}", json!({"method": "initialized", "params": {}}));
-    let _ = writeln!(stdin, "{}", json!({"id": 2, "method": "account/rateLimits/read"}));
-    let _ = stdin.flush();
+        let _ = writeln!(stdin, "{}", json!({"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "herdr-bridge", "version": "1"}}}));
+        let _ = writeln!(stdin, "{}", json!({"method": "initialized", "params": {}}));
+        let _ = writeln!(stdin, "{}", json!({"id": 2, "method": "account/rateLimits/read"}));
+        let _ = stdin.flush();
 
-    let reader = BufReader::new(stdout);
-    let mut result = None;
-    for line in reader.lines().map_while(Result::ok) {
-        if let Ok(msg) = serde_json::from_str::<Value>(&line)
-            && msg["id"] == 2
-        {
-            result = Some(msg);
-            break;
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            if let Ok(msg) = serde_json::from_str::<Value>(&line)
+                && msg["id"] == 2
+            {
+                return Some(msg);
+            }
         }
-    }
+        None
+    })();
+
     let _ = child.kill();
+    let _ = child.wait();
     let msg = result?;
     let limits_obj = &msg["result"]["rateLimits"];
     let plan = limits_obj["planType"].as_str().map(|p| {
@@ -944,11 +947,11 @@ fn curl_get(url: &str, headers: &[(&str, &str)]) -> Option<Value> {
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    let mut stdin = child.stdin.take()?;
-    for (k, v) in headers {
-        writeln!(stdin, "{k}: {v}").ok()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        for (k, v) in headers {
+            let _ = writeln!(stdin, "{k}: {v}");
+        }
     }
-    drop(stdin);
     let out = child.wait_with_output().ok()?;
     if !out.status.success() {
         return None;
