@@ -1,7 +1,8 @@
 //! What an agent has used today, for the app's usage sheet, with real live quota scraping
 //! from the providers and local transcript stats.
 //!
-//! Every function here reads files or probes APIs: call [usage_of] from a blocking thread.
+//! Every function here reads files or probes APIs, which can take seconds (`agy -p /usage`): [usage_of]
+//! answers from its cache at once and does the reading on a thread of its own.
 
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -15,6 +16,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 type Cache = HashMap<String, (Instant, Option<Value>)>;
 static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(Default::default);
 const CACHE_TTL: Duration = Duration::from_secs(30);
+/// The agents being read on a background thread, so a poll never starts a second read of one.
+static READING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
 
 /// Anthropic's usage endpoint answers 429 when asked every [CACHE_TTL]: when it was last asked, and its
 /// last good answer, kept while it refuses.
@@ -22,25 +25,45 @@ type Live = (Option<Instant>, Option<(Option<String>, Vec<Value>)>);
 static CLAUDE_LIVE: LazyLock<Mutex<Live>> = LazyLock::new(Default::default);
 const CLAUDE_LIVE_TTL: Duration = Duration::from_secs(300);
 
+/// Antigravity's quota comes from running `agy`, which starts every MCP server it is configured with
+/// (hundreds of MB and seconds of CPU): when it was last run, and its last good answer.
+static AGY_LIVE: LazyLock<Mutex<(Option<Instant>, Vec<Value>)>> = LazyLock::new(Default::default);
+const AGY_LIVE_TTL: Duration = Duration::from_secs(300);
+
 /// Transcripts last written before this long ago hold nothing from today.
 const RECENT: Duration = Duration::from_secs(26 * 3600);
 
-/// The usage of the agent herdr calls [agent_name], or None when its files say nothing.
+/// The usage of the agent herdr calls [agent_name] as last read, or None when its files say nothing or
+/// it has not been read yet. Never waits on a read: the snapshot it goes into would stall with it, and
+/// with it every update the app gets. A stale or missing one is read again in the background.
 pub fn usage_of(agent_name: &str) -> Option<Value> {
     let name = agent_name.to_lowercase();
     // Its name goes into a file name: anything but a plain name gets none.
     if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
         return None;
     }
-    if let Ok(cache) = CACHE.lock()
-        && let Some((at, usage)) = cache.get(&name)
-        && at.elapsed() < CACHE_TTL
+    let cached = CACHE.lock().ok().and_then(|cache| cache.get(&name).cloned());
+    if cached.as_ref().is_none_or(|(at, _)| at.elapsed() >= CACHE_TTL)
+        && READING.lock().is_ok_and(|mut reading| reading.insert(name.clone()))
     {
-        return usage.clone();
+        std::thread::spawn(move || {
+            let usage = read(&name);
+            if let Ok(mut cache) = CACHE.lock() {
+                cache.insert(name.clone(), (Instant::now(), usage));
+            }
+            if let Ok(mut reading) = READING.lock() {
+                reading.remove(&name);
+            }
+        });
     }
+    cached.and_then(|(_, usage)| usage)
+}
+
+/// Reads the usage of [name] (a plain, lowercase agent name) from its files and providers.
+fn read(name: &str) -> Option<Value> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let home = home.as_deref()?;
-    let usage = if name.contains("claude") || name.contains("anthropic") {
+    if name.contains("claude") || name.contains("anthropic") {
         claude(home)
     } else if name.contains("codex") || name.contains("openai") || name.contains("gpt") {
         codex(home)
@@ -60,11 +83,7 @@ pub fn usage_of(agent_name: &str) -> Option<Value> {
         deepseek(home)
     } else {
         None
-    };
-    if let Ok(mut cache) = CACHE.lock() {
-        cache.insert(name, (Instant::now(), usage.clone()));
     }
-    usage
 }
 
 /// Claude Code: live OAuth rate limits from Anthropic plus local transcript stats.
@@ -432,7 +451,19 @@ fn antigravity(home: &Path) -> Option<Value> {
         }
     }
 
-    let mut limits = antigravity_probe(home);
+    let mut limits = AGY_LIVE
+        .lock()
+        .map(|mut live| {
+            if live.0.is_none_or(|at| at.elapsed() >= AGY_LIVE_TTL) {
+                live.0 = Some(Instant::now());
+                let got = antigravity_probe(home);
+                if !got.is_empty() {
+                    live.1 = got;
+                }
+            }
+            live.1.clone()
+        })
+        .unwrap_or_default();
     if limits.is_empty()
         && let Some(cached) = cache_json(home, &["antigravity", "gemini"])
         && let Some(arr) = cached.get("limits").and_then(|v| v.as_array())
