@@ -4,6 +4,7 @@ mod server;
 mod token;
 mod uploads;
 mod usage;
+pub mod vault;
 
 use clap::Parser;
 use herdr::HerdrClient;

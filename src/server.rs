@@ -40,10 +40,15 @@ pub struct AppState {
 struct Machines {
     local: AppState,
     remote: Arc<Mutex<HashMap<String, AppState>>>,
+    sessions: Arc<Mutex<HashMap<String, AppState>>>,
 }
 
 pub fn create_router(local: AppState, token: String) -> Router {
-    let machines = Machines { local, remote: Default::default() };
+    let machines = Machines {
+        local,
+        remote: Default::default(),
+        sessions: Default::default(),
+    };
     // The routes see one machine's [AppState]; the machine is picked, and its `/m/<id>` prefix cut,
     // before they route. A request is checked first (the last layer runs first), so one refused never
     // reaches a machine: picking a remote one connects to it.
@@ -76,6 +81,15 @@ fn routes() -> Router {
         .route("/api/worktree", pass("worktree.create").get(get_worktree_list))
         .route("/api/worktree/open", pass("worktree.open"))
         .route("/api/uploads", post(post_upload).route_layer(DefaultBodyLimit::disable()))
+        .route("/api/rpc/{method}", post(post_rpc))
+        .route("/api/vault/manifest", get(crate::vault::get_manifest))
+        .route(
+            "/api/vault/file",
+            get(crate::vault::get_file)
+                .post(crate::vault::post_file)
+                .delete(crate::vault::delete_file)
+                .route_layer(DefaultBodyLimit::disable()),
+        )
         .route("/ws/session", get(ws_session_handler))
         .route("/ws/term/{id}", get(ws_term_handler))
 }
@@ -100,6 +114,18 @@ async fn pick_machine(State(machines): State<Machines>, mut req: Request, next: 
         }
         machine = remote[&id].clone();
         drop(remote);
+        *req.uri_mut() = path.parse().unwrap_or_default();
+    } else if let Some(rest) = req.uri().path().strip_prefix("/s/") {
+        let (session, rest) = rest.split_once('/').unwrap_or((rest, ""));
+        let (session, path) = (session.to_string(), format!("/{rest}{}", req.uri().query().map_or(String::new(), |q| format!("?{q}"))));
+        let mut sessions = machines.sessions.lock().await;
+        if !sessions.contains_key(&session) {
+            let herdr = Arc::new(HerdrClient::session(session.clone()));
+            herdr.clone().start_event_listener();
+            sessions.insert(session.clone(), AppState { snapshots: start_snapshot_poller(herdr.clone()), herdr });
+        }
+        machine = sessions[&session].clone();
+        drop(sessions);
         *req.uri_mut() = path.parse().unwrap_or_default();
     }
     req.extensions_mut().insert(machine);
@@ -200,9 +226,15 @@ async fn herdr_cli(args: &[String]) -> Result<(), (StatusCode, String)> {
 /// address (DNS rebinding) to read the snapshot. Its `Host` is then that domain, so only an IP address, a
 /// bare name or a Tailscale MagicDNS name (`*.ts.net`) is accepted.
 async fn reject_browsers(req: Request, next: Next) -> Response {
-    if req.headers().contains_key(header::ORIGIN) {
-        warn!("Refused a browser request to {} (Origin {:?})", req.uri(), req.headers()[header::ORIGIN]);
-        return (StatusCode::FORBIDDEN, "herdr-bridge only accepts the Herdr Mobile app").into_response();
+    if let Some(origin) = req.headers().get(header::ORIGIN).and_then(|h| h.to_str().ok()) {
+        let is_obsidian = origin.starts_with("app://obsidian.md")
+            || origin.starts_with("capacitor://localhost")
+            || origin.starts_with("http://localhost")
+            || origin.starts_with("https://localhost");
+        if !is_obsidian {
+            warn!("Refused a browser request to {} (Origin {:?})", req.uri(), origin);
+            return (StatusCode::FORBIDDEN, "herdr-bridge only accepts the Herdr Mobile app or Herdr Obsidian").into_response();
+        }
     }
     if let Some(host) = req.headers().get(header::HOST).and_then(|h| h.to_str().ok()) {
         let name = if host.starts_with('[') { "::" } else { host.rsplit_once(':').map_or(host, |(name, _)| name) };
@@ -220,9 +252,17 @@ async fn reject_browsers(req: Request, next: Next) -> Response {
 /// come at once: guessing the token's ~40 bits would take thousands of years.
 static REFUSALS: Mutex<()> = Mutex::const_new(());
 
-/// Every request but `/health` carries the bridge's token ([crate::token]) as `Authorization: Bearer`.
+/// Every request but `/health` carries the bridge's token ([crate::token]) as `Authorization: Bearer`
+/// or as a `?token=` query parameter (essential for browser WebSockets).
 async fn require_token(State(token): State<Arc<String>>, req: Request, next: Next) -> Response {
-    let given = req.headers().get(header::AUTHORIZATION).and_then(|h| h.to_str().ok()).and_then(|h| h.strip_prefix("Bearer "));
+    let header_token = req.headers().get(header::AUTHORIZATION).and_then(|h| h.to_str().ok()).and_then(|h| h.strip_prefix("Bearer "));
+    let query_token = req.uri().query().and_then(|q| {
+        q.split('&').find_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            (k == "token").then_some(v)
+        })
+    });
+    let given = header_token.or(query_token);
     if req.uri().path() != "/health" && !given.is_some_and(|g| crate::token::matches(&token, g)) {
         warn!("Refused a request to {} without the right token", req.uri().path());
         let _turn = REFUSALS.lock().await;
@@ -287,6 +327,10 @@ fn pass(method: &'static str) -> MethodRouter {
 /// One herdr call; its error comes back as a 400 with herdr's message.
 async fn rpc(state: &AppState, method: &str, params: Value) -> ApiResult {
     state.herdr.call(method, params).await.map(Json).map_err(|e| (StatusCode::BAD_REQUEST, e))
+}
+
+async fn post_rpc(Extension(state): Extension<AppState>, Path(method): Path<String>, Json(params): Json<Value>) -> ApiResult {
+    rpc(&state, &method, params).await
 }
 
 async fn delete_tab(Extension(state): Extension<AppState>, Path(tab_id): Path<String>) -> ApiResult {
@@ -385,6 +429,7 @@ pub fn start_snapshot_poller(herdr: Arc<HerdrClient>) -> Arc<watch::Sender<Utf8B
     tokio::spawn(async move {
         let mut events = herdr.subscribe();
         let mut tick = tokio::time::interval(Duration::from_millis(1500));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = tick.tick() => {}
@@ -392,6 +437,7 @@ pub fn start_snapshot_poller(herdr: Arc<HerdrClient>) -> Arc<watch::Sender<Utf8B
                     // A burst of events makes one snapshot.
                     Ok(_) | Err(RecvError::Lagged(_)) => {
                         while matches!(events.try_recv(), Ok(_) | Err(TryRecvError::Lagged(_))) {}
+                        tick.reset();
                     }
                     Err(RecvError::Closed) => break,
                 },
@@ -482,10 +528,15 @@ async fn ws_term_handler(
     }
     ws.on_upgrade(move |socket| async move {
         // Focusing is what marks a pane seen in herdr (a `done` agent turns `idle`); the takeover alone
-        // doesn't. The desktop follows the phone to this pane.
-        if let Err(e) = state.herdr.call("pane.focus", json!({ "pane_id": pane_id })).await {
-            warn!("Could not focus pane {}: {}", pane_id, e);
-        }
+        // doesn't. The desktop follows the phone to this pane. Spawned in background so it doesn't delay
+        // the terminal session control attach.
+        let herdr = state.herdr.clone();
+        let pid = pane_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = herdr.call("pane.focus", json!({ "pane_id": pid })).await {
+                warn!("Could not focus pane {}: {}", pid, e);
+            }
+        });
         if let Err(e) = handle_ws_term(socket, &state.herdr, pane_id, size).await {
             warn!("Terminal session ended with error: {}", e);
         }
@@ -593,7 +644,9 @@ async fn handle_ws_term(mut socket: WebSocket, herdr: &HerdrClient, pane_id: Str
                     Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
                     _ => continue,
                 };
-                if stdin.write_all(format!("{cmd}\n").as_bytes()).await.is_err() {
+                if stdin.write_all(format!("{cmd}\n").as_bytes()).await.is_err()
+                    || stdin.flush().await.is_err()
+                {
                     break;
                 }
             }

@@ -1,13 +1,21 @@
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
+
+/// (ssh_target, dir) to its `branch<TAB>ahead<TAB>behind` line and when it was queried. The snapshot
+/// polls every 1.5 s, but git branches change rarely; cached for 10 s so remote machines avoid SSH
+/// subprocess storms.
+static BRANCHES: LazyLock<Mutex<HashMap<(Option<String>, String), (Instant, String)>>> =
+    LazyLock::new(Default::default);
+const BRANCHES_TTL: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug)]
 pub struct HerdrClient {
@@ -57,6 +65,16 @@ impl HerdrClient {
     pub fn remote(id: String, ssh: String, session: String) -> Self {
         let session = (session != "default").then_some(session);
         Self { ssh: Some(ssh), machine: Some(id), session, ..Self::new("") }
+    }
+
+    pub fn session(name: String) -> Self {
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+        let socket_path = home.join(format!(".config/herdr/sessions/{name}/herdr.sock"));
+        Self {
+            socket_path,
+            session: Some(name),
+            ..Self::new("")
+        }
     }
 
     /// Why herdr can't reach this machine either, as `herdr machine status` puts it (e.g. "remote Herdr
@@ -179,18 +197,69 @@ impl HerdrClient {
         self.event_tx.subscribe()
     }
 
+    /// Spawns the local headless herdr server if it is not already running.
+    /// Rate-limited so failure doesn't spawn a storm of processes.
+    async fn try_spawn_server(&self) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static LAST_SPAWN: AtomicU64 = AtomicU64::new(0);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let last = LAST_SPAWN.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < 15 {
+            return;
+        }
+        if LAST_SPAWN.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            return;
+        }
+
+        info!("Local herdr socket unavailable; spawning headless `herdr server`...");
+        let mut cmd = std::process::Command::new("herdr");
+        if let Some(session) = &self.session {
+            cmd.args(["--session", session.as_str()]);
+        }
+        cmd.arg("server")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        match cmd.spawn() {
+            Ok(_) => {
+                // Poll for socket readiness up to 2 seconds
+                for _ in 0..20 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    if UnixStream::connect(&self.socket_path).await.is_ok() {
+                        info!("Herdr server started and listening at {:?}", self.socket_path);
+                        return;
+                    }
+                }
+                warn!("Spawned `herdr server`, but socket {:?} was not ready in 2 s", self.socket_path);
+            }
+            Err(e) => {
+                warn!("Failed to spawn `herdr server`: {e}");
+            }
+        }
+    }
+
     /// Opens a connection to herdr and writes one request to it.
     async fn send(&self, id: &str, method: &str, params: Value) -> Result<Conn, String> {
         let (reader, mut writer, ssh): Conn = if self.ssh.is_none() {
-            let (reader, writer) = UnixStream::connect(&self.socket_path)
-                .await
-                .map_err(|e| match e.kind() {
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
-                        format!("herdr isn't running on this machine (nothing at {:?}): start it", self.socket_path)
-                    }
-                    _ => format!("Failed to connect to herdr socket at {:?}: {}", self.socket_path, e),
-                })?
-                .into_split();
+            let stream = match UnixStream::connect(&self.socket_path).await {
+                Ok(s) => s,
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused) => {
+                    self.try_spawn_server().await;
+                    UnixStream::connect(&self.socket_path).await.map_err(|e| match e.kind() {
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
+                            format!("herdr isn't running on this machine (nothing at {:?}): start it", self.socket_path)
+                        }
+                        _ => format!("Failed to connect to herdr socket at {:?}: {}", self.socket_path, e),
+                    })?
+                }
+                Err(e) => return Err(format!("Failed to connect to herdr socket at {:?}: {}", self.socket_path, e)),
+            };
+            let (reader, writer) = stream.into_split();
             (Box::new(reader), Box::new(writer), None)
         } else {
             let mut child = self
@@ -222,11 +291,13 @@ impl HerdrClient {
 
     /// One request and its response. A herdr that doesn't answer fails the call instead of hanging it.
     pub async fn call(&self, method: &str, params: Value) -> Result<Value, String> {
+        // Git checkout/removal and repository hooks can outlast an ordinary RPC.
+        let timeout = if method.starts_with("worktree.") { 120 } else { 10 };
         let req_id = format!(
             "bridge-{}",
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis()
         );
-        let line = tokio::time::timeout(Duration::from_secs(10), async {
+        let line = tokio::time::timeout(Duration::from_secs(timeout), async {
             let (reader, _writer, ssh) = self.send(&req_id, method, params).await?;
             let mut line = String::new();
             BufReader::new(reader)
@@ -239,7 +310,7 @@ impl HerdrClient {
             Ok::<_, String>(line)
         })
         .await
-        .map_err(|_| format!("herdr did not answer {method} within 10 s"))??;
+        .map_err(|_| format!("herdr did not answer {method} within {timeout} s; the operation may still finish"))??;
 
         let res: Value = serde_json::from_str(&line).map_err(|e| {
             debug!("Unparsable herdr response: {}", line);
@@ -253,7 +324,8 @@ impl HerdrClient {
         Ok(res.get("result").cloned().unwrap_or(Value::Null))
     }
 
-    /// `session.snapshot`, with a `git_branch` added to each workspace (Herdr's API doesn't expose it).
+    /// `session.snapshot`, with a `git_branch` added to each workspace (Herdr's API doesn't expose it),
+    /// and `git_ahead`/`git_behind` when that branch has an upstream.
     pub async fn snapshot(&self) -> Result<Value, String> {
         let mut res = self.call("session.snapshot", json!({})).await?;
         let snap = if res.get("snapshot").is_some() { &mut res["snapshot"] } else { &mut res };
@@ -290,18 +362,17 @@ impl HerdrClient {
         let panes = snap["panes"].as_array().cloned().unwrap_or_default();
         let Some(workspaces) = snap["workspaces"].as_array_mut() else { return Ok(res) };
 
-        // A workspace's directory: the focused pane of its active tab, else its worktree checkout.
+        // Worktree identity belongs to the checkout, even when a shell changes directory.
         let dirs: Vec<Option<String>> = workspaces
             .iter()
             .map(|ws| {
                 let tab_panes: Vec<&Value> = panes.iter().filter(|p| p["tab_id"] == ws["active_tab_id"]).collect();
                 let pane = tab_panes.iter().find(|p| p["focused"] == true).or(tab_panes.first());
-                pane.and_then(|p| p["foreground_cwd"].as_str().or(p["cwd"].as_str()))
+                ws["worktree"]["checkout_path"].as_str()
+                    .or_else(|| pane.and_then(|p| p["foreground_cwd"].as_str().or(p["cwd"].as_str())))
                     .map(String::from)
-                    .or_else(|| ws["worktree"]["checkout_path"].as_str().map(String::from))
             })
             .collect();
-
         // If a non-linked workspace inherited a stale worktree whose repo does not match the
         // pane's directory, drop it so the workspace is not tied to an unrelated repository.
         for (ws, dir) in workspaces.iter_mut().zip(&dirs) {
@@ -316,17 +387,55 @@ impl HerdrClient {
             }
         }
 
-        // One command for every workspace, one line each (empty without a branch): on a remote machine it
-        // is one SSH round trip.
-        const SCRIPT: &str = r#"for d; do b=; [ -n "$d" ] && b=$(git -C "$d" branch --show-current 2>/dev/null); printf '%s\n' "$b"; done"#;
-        let mut args = vec!["-c", SCRIPT, "sh"];
-        args.extend(dirs.iter().map(|d| d.as_deref().unwrap_or("")));
-        let mut cmd = self.command("sh", &args);
-        cmd.kill_on_drop(true);
-        let Ok(Ok(out)) = tokio::time::timeout(Duration::from_secs(10), cmd.output()).await else { return Ok(res) };
-        for (ws, branch) in workspaces.iter_mut().zip(String::from_utf8_lossy(&out.stdout).lines()) {
-            if !branch.trim().is_empty() {
-                ws["git_branch"] = Value::String(branch.trim().to_string());
+        let needs_fetch = dirs.iter().any(|d| match d {
+            Some(dir) if !dir.is_empty() => {
+                let cache = BRANCHES.lock().ok();
+                cache.and_then(|c| c.get(&(self.ssh.clone(), dir.clone())).cloned())
+                    .is_none_or(|(at, _)| at.elapsed() >= BRANCHES_TTL)
+            }
+            _ => false,
+        });
+
+        if needs_fetch && dirs.iter().any(|d| d.as_deref().is_some_and(|s| !s.is_empty())) {
+            // One command for every workspace, one line each: its branch, then the commits it is ahead of and
+            // behind its upstream as last fetched (both left out without one); empty outside a branch. On a
+            // remote machine it is one SSH round trip.
+            const SCRIPT: &str = r#"for d; do b=; c=; if [ -n "$d" ]; then b=$(git -C "$d" branch --show-current 2>/dev/null); [ -n "$b" ] && c=$(git -C "$d" rev-list --left-right --count 'HEAD...@{upstream}' 2>/dev/null); fi; printf '%s\t%s\n' "$b" "$c"; done"#;
+            let mut args = vec!["-c", SCRIPT, "sh"];
+            args.extend(dirs.iter().map(|d| d.as_deref().unwrap_or("")));
+            let mut cmd = self.command("sh", &args);
+            cmd.kill_on_drop(true);
+            if let Ok(Ok(out)) = tokio::time::timeout(Duration::from_secs(10), cmd.output()).await {
+                let stdout_str = String::from_utf8_lossy(&out.stdout);
+                let lines: Vec<&str> = stdout_str.lines().collect();
+                if let Ok(mut cache) = BRANCHES.lock() {
+                    let now = Instant::now();
+                    for (dir, line) in dirs.iter().zip(lines) {
+                        if let Some(dir) = dir.as_deref().filter(|d| !d.is_empty()) {
+                            cache.insert((self.ssh.clone(), dir.to_string()), (now, line.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Ok(cache) = BRANCHES.lock() {
+            for (ws, dir) in workspaces.iter_mut().zip(dirs.iter()) {
+                if let Some(dir) = dir.as_deref().filter(|d| !d.is_empty())
+                    && let Some((_, line)) = cache.get(&(self.ssh.clone(), dir.to_string()))
+                {
+                    let mut fields = line.split('\t').map(str::trim);
+                    let branch = fields.next().unwrap_or("");
+                    if branch.is_empty() {
+                        continue;
+                    }
+                    ws["git_branch"] = Value::String(branch.to_string());
+                    for key in ["git_ahead", "git_behind"] {
+                        if let Some(n) = fields.next().and_then(|n| n.parse::<u64>().ok()) {
+                            ws[key] = json!(n);
+                        }
+                    }
+                }
             }
         }
         Ok(res)
