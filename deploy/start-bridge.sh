@@ -10,8 +10,8 @@ PORT="${HERDR_BRIDGE_PORT:-7788}"
 BINARY=""
 for candidate in \
   "$HOME/.local/bin/herdr-bridge" \
-  "$(dirname "$0")/../bridge/target/release/herdr-bridge" \
-  "$(dirname "$0")/../bridge/target/debug/herdr-bridge" \
+  "$(dirname "$0")/../target/release/herdr-bridge" \
+  "$(dirname "$0")/../target/debug/herdr-bridge" \
   "$(which herdr-bridge 2>/dev/null || true)"
 do
   if [[ -n "$candidate" && -x "$candidate" && ! -d "$candidate" ]]; then

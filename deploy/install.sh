@@ -6,14 +6,14 @@ BIN_DIR="$HOME/.local/bin"
 mkdir -p "$BIN_DIR"
 
 # 1. Install binary
-if [[ -f "$SCRIPT_DIR/../bridge/target/release/herdr-bridge" ]]; then
-  install -m 755 "$SCRIPT_DIR/../bridge/target/release/herdr-bridge" "$BIN_DIR/herdr-bridge"
-elif [[ -f "$SCRIPT_DIR/../bridge/target/debug/herdr-bridge" ]]; then
-  install -m 755 "$SCRIPT_DIR/../bridge/target/debug/herdr-bridge" "$BIN_DIR/herdr-bridge"
-elif which cargo >/dev/null 2>&1 && [[ -d "$SCRIPT_DIR/../bridge" ]]; then
+if [[ -f "$SCRIPT_DIR/../target/release/herdr-bridge" ]]; then
+  install -m 755 "$SCRIPT_DIR/../target/release/herdr-bridge" "$BIN_DIR/herdr-bridge"
+elif [[ -f "$SCRIPT_DIR/../target/debug/herdr-bridge" ]]; then
+  install -m 755 "$SCRIPT_DIR/../target/debug/herdr-bridge" "$BIN_DIR/herdr-bridge"
+elif which cargo >/dev/null 2>&1 && [[ -d "$SCRIPT_DIR/.." ]]; then
   echo "Building herdr-bridge via cargo..."
-  cargo build --release --manifest-path "$SCRIPT_DIR/../bridge/Cargo.toml"
-  install -m 755 "$SCRIPT_DIR/../bridge/target/release/herdr-bridge" "$BIN_DIR/herdr-bridge"
+  cargo build --release --manifest-path "$SCRIPT_DIR/../Cargo.toml"
+  install -m 755 "$SCRIPT_DIR/../target/release/herdr-bridge" "$BIN_DIR/herdr-bridge"
 else
   echo "Error: herdr-bridge binary not found. Please build it first with 'cargo build --release'." >&2
   exit 1
