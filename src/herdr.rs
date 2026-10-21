@@ -362,14 +362,16 @@ impl HerdrClient {
         let panes = snap["panes"].as_array().cloned().unwrap_or_default();
         let Some(workspaces) = snap["workspaces"].as_array_mut() else { return Ok(res) };
 
-        // Worktree identity belongs to the checkout, even when a shell changes directory.
+        // A linked worktree's directory is its checkout, even when a shell changes directory; any other
+        // workspace's is the focused pane of its active tab, since herdr can keep a stale main checkout.
         let dirs: Vec<Option<String>> = workspaces
             .iter()
             .map(|ws| {
                 let tab_panes: Vec<&Value> = panes.iter().filter(|p| p["tab_id"] == ws["active_tab_id"]).collect();
                 let pane = tab_panes.iter().find(|p| p["focused"] == true).or(tab_panes.first());
-                ws["worktree"]["checkout_path"].as_str()
-                    .or_else(|| pane.and_then(|p| p["foreground_cwd"].as_str().or(p["cwd"].as_str())))
+                let checkout = ws["worktree"]["checkout_path"].as_str();
+                let cwd = pane.and_then(|p| p["foreground_cwd"].as_str().or(p["cwd"].as_str()));
+                if ws["worktree"]["is_linked_worktree"] == true { checkout.or(cwd) } else { cwd.or(checkout) }
                     .map(String::from)
             })
             .collect();
