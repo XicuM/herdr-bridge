@@ -197,7 +197,9 @@ impl HerdrClient {
         self.event_tx.subscribe()
     }
 
-    /// Spawns the local headless herdr server if it is not already running.
+    /// Starts the local headless herdr server if it is not already running, outside the bridge's own
+    /// process tree: as its own transient systemd user unit when there is one (a restart of the bridge
+    /// kills everything in its cgroup, `setsid` doesn't leave it), else in a session of its own.
     /// Rate-limited so failure doesn't spawn a storm of processes.
     async fn try_spawn_server(&self) {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -216,17 +218,26 @@ impl HerdrClient {
         }
 
         info!("Local herdr socket unavailable; spawning headless `herdr server`...");
-        let mut cmd = std::process::Command::new("herdr");
+        let mut herdr = vec!["herdr".to_string()];
         if let Some(session) = &self.session {
-            cmd.args(["--session", session.as_str()]);
+            herdr.extend(["--session".to_string(), session.clone()]);
         }
-        cmd.arg("server")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+        herdr.push("server".to_string());
+        let mut cmd = std::process::Command::new("systemd-run");
+        cmd.args(["--user", "--quiet", "--collect", "--same-dir", "--setenv=PATH"]).args(&herdr);
+        cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let started = match cmd.status() {
+            Ok(st) if st.success() => Ok(()),
+            _ => {
+                use std::os::unix::process::CommandExt;
+                let mut cmd = std::process::Command::new("setsid");
+                cmd.args(&herdr).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+                cmd.process_group(0).spawn().map(|_| ())
+            }
+        };
 
-        match cmd.spawn() {
-            Ok(_) => {
+        match started {
+            Ok(()) => {
                 // Poll for socket readiness up to 2 seconds
                 for _ in 0..20 {
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -400,9 +411,10 @@ impl HerdrClient {
 
         if needs_fetch && dirs.iter().any(|d| d.as_deref().is_some_and(|s| !s.is_empty())) {
             // One command for every workspace, one line each: its branch, then the commits it is ahead of and
-            // behind its upstream as last fetched (both left out without one); empty outside a branch. On a
-            // remote machine it is one SSH round trip.
-            const SCRIPT: &str = r#"for d; do b=; c=; if [ -n "$d" ]; then b=$(git -C "$d" branch --show-current 2>/dev/null); [ -n "$b" ] && c=$(git -C "$d" rev-list --left-right --count 'HEAD...@{upstream}' 2>/dev/null); fi; printf '%s\t%s\n' "$b" "$c"; done"#;
+            // behind its upstream as last fetched; without one, those against the main checkout's HEAD, which
+            // a worktree herdr made from it has instead (level, so nothing shown, in the main checkout itself);
+            // empty outside a branch. On a remote machine it is one SSH round trip.
+            const SCRIPT: &str = r#"for d; do b=; c=; if [ -n "$d" ]; then b=$(git -C "$d" branch --show-current 2>/dev/null); [ -n "$b" ] && c=$(git -C "$d" rev-list --left-right --count 'HEAD...@{upstream}' 2>/dev/null || git -C "$d" rev-list --left-right --count 'HEAD...main-worktree/HEAD' 2>/dev/null); fi; printf '%s\t%s\n' "$b" "$c"; done"#;
             let mut args = vec!["-c", SCRIPT, "sh"];
             args.extend(dirs.iter().map(|d| d.as_deref().unwrap_or("")));
             let mut cmd = self.command("sh", &args);
