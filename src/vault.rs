@@ -69,6 +69,36 @@ async fn vault_dir(name: &str) -> Result<PathBuf, (StatusCode, String)> {
     find_vault(&registry, name)
 }
 
+/// The vault (its folder's name, as the plugin knows it) in `registry` that holds `file`, and the
+/// file's path inside it. The innermost vault wins when one sits inside another.
+fn find_vault_of(registry: &str, file: &Path) -> Result<(String, String), (StatusCode, String)> {
+    let registry: Value = serde_json::from_str(registry)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Unreadable Obsidian vault list: {e}")))?;
+    registry["vaults"]
+        .as_object()
+        .into_iter()
+        .flat_map(|vaults| vaults.values())
+        .filter_map(|v| v["path"].as_str().map(PathBuf::from))
+        .filter_map(|root| Some((root.file_name()?.to_string_lossy().into_owned(), file.strip_prefix(&root).ok()?.to_string_lossy().into_owned(), root)))
+        .max_by_key(|(_, _, root)| root.components().count())
+        .map(|(name, rel, _)| (name, rel))
+        .ok_or((StatusCode::NOT_FOUND, format!("{} is not inside an Obsidian vault on this machine", file.display())))
+}
+
+pub async fn vault_of(file: &str) -> Result<(String, String), (StatusCode, String)> {
+    let file = Path::new(file);
+    // `..` would climb out of the vault after the prefix check.
+    if !file.is_absolute() || file.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return Err((StatusCode::BAD_REQUEST, "Invalid path: absolute, without `..`".into()));
+    }
+    let path = obsidian_registry()
+        .ok_or((StatusCode::NOT_FOUND, "No Obsidian vault list on this machine: is Obsidian installed here?".to_string()))?;
+    let registry = fs::read_to_string(&path)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to read {}: {e}", path.display())))?;
+    find_vault_of(&registry, file)
+}
+
 fn mtime_secs(meta: &Metadata) -> u64 {
     meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -213,6 +243,16 @@ mod tests {
         assert_eq!(find_vault(registry, "Missing").unwrap_err().0, StatusCode::NOT_FOUND);
         assert_eq!(find_vault(registry, "Notes").unwrap_err().0, StatusCode::CONFLICT);
         assert_eq!(find_vault(registry, "Vaults").unwrap_err().0, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn finds_the_vault_holding_a_file() {
+        let registry = r#"{"vaults":{"a":{"path":"/home/u/Notes"},"b":{"path":"/home/u/Notes/Inner"}}}"#;
+        let found = |f: &str| find_vault_of(registry, Path::new(f)).ok();
+        assert_eq!(found("/home/u/Notes/a/b.md"), Some(("Notes".into(), "a/b.md".into())));
+        assert_eq!(found("/home/u/Notes/Inner/c.md"), Some(("Inner".into(), "c.md".into())));
+        assert_eq!(found("/home/u/Notes2/c.md"), None);
+        assert_eq!(found("/etc/passwd"), None);
     }
 
     #[test]

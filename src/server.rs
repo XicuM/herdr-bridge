@@ -22,7 +22,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{broadcast, watch, Mutex};
 use tower_http::trace::TraceLayer;
 use tracing::warn;
 
@@ -32,6 +32,8 @@ pub struct AppState {
     pub herdr: Arc<HerdrClient>,
     /// The latest snapshot, as sent to each `/ws/session` ([start_snapshot_poller]).
     pub snapshots: Arc<watch::Sender<Utf8Bytes>>,
+    /// Notes agents ask Obsidian to show, as `/ws/session` messages (`POST /api/obsidian/open`).
+    pub opens: broadcast::Sender<Utf8Bytes>,
 }
 
 /// Every machine the bridge serves: its own, at `/`, and each one saved in herdr (`herdr machine list`)
@@ -90,6 +92,7 @@ fn routes() -> Router {
                 .delete(crate::vault::delete_file)
                 .route_layer(DefaultBodyLimit::disable()),
         )
+        .route("/api/obsidian/open", post(post_obsidian_open))
         .route("/ws/session", get(ws_session_handler))
         .route("/ws/term/{id}", get(ws_term_handler))
 }
@@ -110,7 +113,7 @@ async fn pick_machine(State(machines): State<Machines>, mut req: Request, next: 
                 saved["session"].as_str().unwrap_or("default").into(),
             ));
             herdr.clone().start_event_listener();
-            remote.insert(id.clone(), AppState { snapshots: start_snapshot_poller(herdr.clone()), herdr });
+            remote.insert(id.clone(), AppState { snapshots: start_snapshot_poller(herdr.clone()), herdr, opens: broadcast::channel(16).0 });
         }
         machine = remote[&id].clone();
         drop(remote);
@@ -122,7 +125,7 @@ async fn pick_machine(State(machines): State<Machines>, mut req: Request, next: 
         if !sessions.contains_key(&session) {
             let herdr = Arc::new(HerdrClient::session(session.clone()));
             herdr.clone().start_event_listener();
-            sessions.insert(session.clone(), AppState { snapshots: start_snapshot_poller(herdr.clone()), herdr });
+            sessions.insert(session.clone(), AppState { snapshots: start_snapshot_poller(herdr.clone()), herdr, opens: broadcast::channel(16).0 });
         }
         machine = sessions[&session].clone();
         drop(sessions);
@@ -398,6 +401,24 @@ async fn get_worktree_list(Extension(state): Extension<AppState>, Query(query): 
     rpc(&state, "worktree.list", params).await
 }
 
+#[derive(Deserialize)]
+struct ObsidianOpen {
+    /// Absolute path of the note, made by `herdr-bridge obsidian open` from the agent's directory.
+    file: String,
+    heading: Option<String>,
+    line: Option<u64>,
+}
+
+/// Tells Obsidian to show a note: the plugin of that vault gets an `open` message on `/ws/session`.
+/// Only files inside a vault in Obsidian's list on this machine are accepted.
+async fn post_obsidian_open(Extension(state): Extension<AppState>, Json(req): Json<ObsidianOpen>) -> ApiResult {
+    let (vault, path) = crate::vault::vault_of(&req.file).await?;
+    let msg = json!({ "type": "open", "vault": vault, "path": path, "heading": req.heading, "line": req.line });
+    // Nobody connected means Obsidian isn't running with the plugin: the agent should hear it.
+    state.opens.send(msg.to_string().into()).map_err(|_| (StatusCode::CONFLICT, "No Obsidian with the Herdr plugin is connected".to_string()))?;
+    Ok(Json(json!({ "status": "ok", "vault": vault, "path": path })))
+}
+
 async fn ws_session_handler(
     ws: WebSocketUpgrade,
     Extension(state): Extension<AppState>,
@@ -465,6 +486,7 @@ pub fn start_snapshot_poller(herdr: Arc<HerdrClient>) -> Arc<watch::Sender<Utf8B
 async fn handle_ws_session(socket: WebSocket, state: AppState) {
     let (mut sender, mut receiver) = socket.split();
     let mut snapshots = state.snapshots.subscribe();
+    let mut opens = state.opens.subscribe();
     let herdr = state.herdr.clone();
 
     let mut send_task = tokio::spawn(async move {
@@ -473,12 +495,25 @@ async fn handle_ws_session(socket: WebSocket, state: AppState) {
         if !last.is_empty() && sender.send(Message::Text(last.clone())).await.is_err() {
             return;
         }
-        while snapshots.changed().await.is_ok() {
-            let text = snapshots.borrow_and_update().clone();
-            if text == last {
-                continue;
-            }
-            last = text.clone();
+        loop {
+            let text = tokio::select! {
+                changed = snapshots.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let text = snapshots.borrow_and_update().clone();
+                    if text == last {
+                        continue;
+                    }
+                    last = text.clone();
+                    text
+                }
+                open = opens.recv() => match open {
+                    Ok(text) => text,
+                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => break,
+                },
+            };
             if sender.send(Message::Text(text)).await.is_err() {
                 break;
             }

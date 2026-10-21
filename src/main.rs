@@ -6,7 +6,7 @@ mod uploads;
 mod usage;
 pub mod vault;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use herdr::HerdrClient;
 use server::{create_router, AppState};
 use std::net::{IpAddr, SocketAddr};
@@ -37,6 +37,54 @@ struct Args {
     /// Print the token (making it if needed) and exit, to type it into the app.
     #[arg(long)]
     print_token: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Things agents ask of the Obsidian app, through its Herdr plugin.
+    Obsidian {
+        #[command(subcommand)]
+        action: ObsidianAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ObsidianAction {
+    /// Show a note in Obsidian: `obsidian open notes/Plan.md#Goals --line 12`.
+    Open {
+        /// A path from the current directory, with an optional `#heading`.
+        target: String,
+        #[arg(long)]
+        line: Option<u64>,
+    },
+}
+
+/// Asks the running bridge to show a note, with a bare HTTP request: the one call isn't worth a client crate.
+async fn obsidian_open(args: &Args, target: &str, line: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (path, heading) = match target.split_once('#') {
+        Some((p, h)) => (p, Some(h)),
+        None => (target, None),
+    };
+    let file = std::env::current_dir()?.join(path);
+    let body = serde_json::json!({ "file": file, "heading": heading, "line": line }).to_string();
+    let token = token::load_or_create(&args.token_file)?;
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", args.port)).await.map_err(|e| format!("herdr-bridge is not running on port {}: {e}", args.port))?;
+    let request = format!(
+        "POST /s/herdr-obsidian/api/obsidian/open HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).await?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await?;
+    let (head, reply) = response.split_once("\r\n\r\n").unwrap_or((&response, ""));
+    if head.starts_with("HTTP/1.1 200") {
+        return Ok(());
+    }
+    Err(reply.trim().to_string().into())
 }
 
 fn default_token_path() -> PathBuf {
@@ -68,6 +116,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
+    if let Some(Command::Obsidian { action: ObsidianAction::Open { target, line } }) = &args.command {
+        return obsidian_open(&args, target, *line).await;
+    }
     let token = token::load_or_create(&args.token_file)?;
     if args.print_token {
         println!("{token}");
@@ -86,6 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState {
         herdr: herdr.clone(),
         snapshots: server::start_snapshot_poller(herdr.clone()),
+        opens: tokio::sync::broadcast::channel(16).0,
     };
 
     let app = create_router(state, token);
