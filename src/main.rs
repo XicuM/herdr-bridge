@@ -1,3 +1,4 @@
+mod deliveries;
 mod herdr;
 mod monitors;
 mod server;
@@ -50,6 +51,15 @@ enum Command {
         #[command(subcommand)]
         action: ObsidianAction,
     },
+    /// Send a file to the user's herdr-mobile, which offers to open it (an APK, to install it):
+    /// `send build/app-release.apk --title "Debug build with the fix"`.
+    Send {
+        /// A path from the current directory.
+        path: PathBuf,
+        /// One line on what it is, shown under the file's name.
+        #[arg(long)]
+        title: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -63,19 +73,35 @@ enum ObsidianAction {
     },
 }
 
-/// Asks the running bridge to show a note, with a bare HTTP request: the one call isn't worth a client crate.
+/// Asks the running bridge to show a note.
 async fn obsidian_open(args: &Args, target: &str, line: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let (path, heading) = match target.split_once('#') {
         Some((p, h)) => (p, Some(h)),
         None => (target, None),
     };
     let file = std::env::current_dir()?.join(path);
-    let body = serde_json::json!({ "file": file, "heading": heading, "line": line }).to_string();
+    post_to_bridge(args, "/s/herdr-obsidian/api/obsidian/open", serde_json::json!({ "file": file, "heading": heading, "line": line })).await
+}
+
+/// Asks the running bridge to send a file to herdr-mobile, naming the agent's pane when it is in the
+/// default session, the one the app shows.
+async fn send(args: &Args, path: &std::path::Path, title: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let file = std::env::current_dir()?.join(path);
+    let default_session = std::env::var("HERDR_SOCKET_PATH").map_or(true, |s| !s.contains("/sessions/"));
+    let pane_id = std::env::var("HERDR_PANE_ID").ok().filter(|_| default_session);
+    post_to_bridge(args, "/api/deliveries", serde_json::json!({ "file": file, "title": title, "pane_id": pane_id })).await?;
+    println!("Sent {} to herdr-mobile: the user is notified and opens it from there.", file.display());
+    Ok(())
+}
+
+/// One POST to the running bridge, with a bare HTTP request: the CLI's few calls aren't worth a client crate.
+async fn post_to_bridge(args: &Args, route: &str, body: serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let body = body.to_string();
     let token = token::load_or_create(&args.token_file)?;
     let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", args.port)).await.map_err(|e| format!("herdr-bridge is not running on port {}: {e}", args.port))?;
     let request = format!(
-        "POST /s/herdr-obsidian/api/obsidian/open HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST {route} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(request.as_bytes()).await?;
@@ -117,8 +143,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
-    if let Some(Command::Obsidian { action: ObsidianAction::Open { target, line } }) = &args.command {
-        return obsidian_open(&args, target, *line).await;
+    match &args.command {
+        Some(Command::Obsidian { action: ObsidianAction::Open { target, line } }) => return obsidian_open(&args, target, *line).await,
+        Some(Command::Send { path, title }) => return send(&args, path, title.as_deref()).await,
+        None => {}
     }
     let token = token::load_or_create(&args.token_file)?;
     if args.print_token {
@@ -139,6 +167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         herdr: herdr.clone(),
         snapshots: server::start_snapshot_poller(herdr.clone()),
         opens: tokio::sync::broadcast::channel(16).0,
+        deliveries: tokio::sync::broadcast::channel(16).0,
         vault: vault::Watcher::new(),
     };
 

@@ -34,6 +34,10 @@ pub struct AppState {
     pub snapshots: Arc<watch::Sender<Utf8Bytes>>,
     /// Notes agents ask Obsidian to show, as `/ws/session` messages (`POST /api/obsidian/open`).
     pub opens: broadcast::Sender<Utf8Bytes>,
+    /// Files agents send to the user (`POST /api/deliveries`), as `/ws/session` messages to herdr-mobile:
+    /// one for the bridge's own machine and its sessions, since the CLI posts to `/`; a remote machine's
+    /// is never sent to, or a phone would hear each file once per machine it reaches through this bridge.
+    pub deliveries: broadcast::Sender<Utf8Bytes>,
     /// This machine's Obsidian vaults, whose changes go to every `/ws/session`: one for all machines.
     pub vault: Arc<crate::vault::Watcher>,
 }
@@ -97,12 +101,15 @@ fn routes() -> Router {
                 .route_layer(DefaultBodyLimit::disable()),
         )
         .route("/api/obsidian/open", post(post_obsidian_open))
+        .route("/api/deliveries", post(post_delivery))
+        .route("/api/deliveries/{id}", get(get_delivery))
         .route("/ws/session", get(ws_session_handler))
         .route("/ws/term/{id}", get(ws_term_handler))
 }
 
 async fn pick_machine(State(machines): State<Machines>, mut req: Request, next: Next) -> Response {
     let vault = machines.local.vault.clone();
+    let deliveries = machines.local.deliveries.clone();
     let mut machine = machines.local;
     if let Some(rest) = req.uri().path().strip_prefix("/m/") {
         let (id, rest) = rest.split_once('/').unwrap_or((rest, ""));
@@ -118,7 +125,13 @@ async fn pick_machine(State(machines): State<Machines>, mut req: Request, next: 
                 saved["session"].as_str().unwrap_or("default").into(),
             ));
             herdr.clone().start_event_listener();
-            remote.insert(id.clone(), AppState { snapshots: start_snapshot_poller(herdr.clone()), herdr, opens: broadcast::channel(16).0, vault });
+            remote.insert(id.clone(), AppState {
+                snapshots: start_snapshot_poller(herdr.clone()),
+                herdr,
+                opens: broadcast::channel(16).0,
+                deliveries: broadcast::channel(16).0,
+                vault,
+            });
         }
         machine = remote[&id].clone();
         drop(remote);
@@ -130,7 +143,7 @@ async fn pick_machine(State(machines): State<Machines>, mut req: Request, next: 
         if !sessions.contains_key(&session) {
             let herdr = Arc::new(HerdrClient::session(session.clone()));
             herdr.clone().start_event_listener();
-            sessions.insert(session.clone(), AppState { snapshots: start_snapshot_poller(herdr.clone()), herdr, opens: broadcast::channel(16).0, vault });
+            sessions.insert(session.clone(), AppState { snapshots: start_snapshot_poller(herdr.clone()), herdr, opens: broadcast::channel(16).0, deliveries, vault });
         }
         machine = sessions[&session].clone();
         drop(sessions);
@@ -424,11 +437,104 @@ async fn post_obsidian_open(Extension(state): Extension<AppState>, Json(req): Js
     Ok(Json(json!({ "status": "ok", "vault": vault, "path": path })))
 }
 
+#[derive(Deserialize)]
+struct Delivery {
+    /// Absolute path of the file, made by `herdr-bridge send` from the agent's directory.
+    file: String,
+    title: Option<String>,
+    /// The sending agent's pane in the default session (`HERDR_PANE_ID`), for the app to show it there.
+    pane_id: Option<String>,
+}
+
+/// Sends a file to herdr-mobile: copies it into [crate::deliveries::dir] and tells every app connected from
+/// another device ([receives_deliveries]), which fetches it from [get_delivery] when the user opens it.
+async fn post_delivery(Extension(state): Extension<AppState>, Json(req): Json<Delivery>) -> ApiResult {
+    // Nobody to tell means the agent should say so, rather than leave a file nobody will see.
+    let nobody = || (StatusCode::CONFLICT, "No herdr-mobile is connected from another device".to_string());
+    if state.deliveries.receiver_count() == 0 {
+        return Err(nobody());
+    }
+    let source = std::path::Path::new(&req.file);
+    let meta = tokio::fs::metadata(source).await.map_err(|e| (StatusCode::NOT_FOUND, format!("{}: {e}", req.file)))?;
+    if !source.is_absolute() || !meta.is_file() {
+        return Err((StatusCode::BAD_REQUEST, format!("{} is not a file", req.file)));
+    }
+    if meta.len() > crate::deliveries::MAX_BYTES {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, "Files over 200 MB can't be sent".into()));
+    }
+    let name = source.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let error = |e: std::io::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("Could not keep the file: {e}"));
+    let id = crate::deliveries::new_id().map_err(error)?;
+    let dir = crate::deliveries::dir();
+    tokio::fs::copy(source, dir.join(format!("{id}-{name}"))).await.map_err(error)?;
+    tokio::task::spawn_blocking(move || crate::uploads::prune(dir, crate::deliveries::KEEP));
+    let msg = json!({
+        "type": "delivery",
+        "id": id,
+        "name": name,
+        "size": meta.len(),
+        "mime": crate::deliveries::mime_of(&name),
+        "title": req.title,
+        "pane_id": req.pane_id,
+    });
+    state.deliveries.send(msg.to_string().into()).map_err(|_| nobody())?;
+    Ok(Json(json!({ "status": "ok", "id": id, "name": name })))
+}
+
+/// A delivered file, by the id its `delivery` message gave; streamed, since an APK runs to tens of MB.
+async fn get_delivery(Path(id): Path<String>) -> Result<Response, (StatusCode, String)> {
+    let gone = || (StatusCode::NOT_FOUND, "That file is no longer kept: ask the agent to send it again".to_string());
+    if !crate::deliveries::is_id(&id) {
+        return Err(gone());
+    }
+    let path = tokio::task::spawn_blocking(move || crate::deliveries::find(&id)).await.ok().flatten().ok_or_else(gone)?;
+    let file = tokio::fs::File::open(&path).await.map_err(|_| gone())?;
+    let len = file.metadata().await.map_err(|_| gone())?.len();
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    // A read error ends the stream after it is sent, rather than being read again.
+    let chunks = futures_util::stream::unfold(Some(file), |file| async move {
+        let mut file = file?;
+        let mut buf = vec![0u8; 64 * 1024];
+        match file.read(&mut buf).await {
+            Ok(0) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                Some((Ok(axum::body::Bytes::from(buf)), Some(file)))
+            }
+            Err(e) => Some((Err(e), None)),
+        }
+    });
+    let headers = [
+        (header::CONTENT_TYPE, crate::deliveries::mime_of(&name).to_string()),
+        (header::CONTENT_LENGTH, len.to_string()),
+        // Already set, so [CompressionLayer] leaves it alone: gzipping an APK or a PDF costs time and saves nothing.
+        (header::CONTENT_ENCODING, "identity".to_string()),
+    ];
+    Ok((headers, axum::body::Body::from_stream(chunks)).into_response())
+}
+
 async fn ws_session_handler(
     ws: WebSocketUpgrade,
+    headers: axum::http::HeaderMap,
     Extension(state): Extension<AppState>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(|socket| handle_ws_session(socket, state))
+    let deliveries = receives_deliveries(&headers);
+    ws.on_upgrade(move |socket| handle_ws_session(socket, state, deliveries))
+}
+
+/// Whether a `/ws/session` gets `delivery` messages: herdr-mobile's (which sends no `Origin`; Obsidian's
+/// does) on another device. The app on the bridge's own machine (`Host` a loopback address) already has
+/// the file, so it isn't sent there, nor counted as someone the agent's file reached.
+fn receives_deliveries(headers: &axum::http::HeaderMap) -> bool {
+    if headers.contains_key(header::ORIGIN) {
+        return false;
+    }
+    let Some(host) = headers.get(header::HOST).and_then(|h| h.to_str().ok()) else { return true };
+    let name = match host.strip_prefix('[') {
+        Some(rest) => rest.split_once(']').map_or(rest, |(name, _)| name),
+        None => host.rsplit_once(':').map_or(host, |(name, _)| name),
+    };
+    !(name.eq_ignore_ascii_case("localhost") || name.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback()))
 }
 
 /// The snapshot as `/ws/session` sends it.
@@ -488,10 +594,11 @@ pub fn start_snapshot_poller(herdr: Arc<HerdrClient>) -> Arc<watch::Sender<Utf8B
     snapshots
 }
 
-async fn handle_ws_session(socket: WebSocket, state: AppState) {
+async fn handle_ws_session(socket: WebSocket, state: AppState, deliveries: bool) {
     let (mut sender, mut receiver) = socket.split();
     let mut snapshots = state.snapshots.subscribe();
     let mut opens = state.opens.subscribe();
+    let mut deliveries = deliveries.then(|| state.deliveries.subscribe());
     let mut vault_changes = state.vault.changes.subscribe();
     let herdr = state.herdr.clone();
     let vault = state.vault.clone();
@@ -517,6 +624,16 @@ async fn handle_ws_session(socket: WebSocket, state: AppState) {
                     text
                 }
                 open = opens.recv() => match open {
+                    Ok(text) => text,
+                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => break,
+                },
+                delivery = async {
+                    match deliveries.as_mut() {
+                        Some(d) => d.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => match delivery {
                     Ok(text) => text,
                     Err(RecvError::Lagged(_)) => continue,
                     Err(RecvError::Closed) => break,

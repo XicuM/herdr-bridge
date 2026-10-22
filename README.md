@@ -67,6 +67,16 @@ herdr-bridge obsidian open notes/Plan.md#Goals --line 12
 
 The path is relative to the agent's directory and must be inside a vault Obsidian knows. The bridge tells the Herdr plugin of that vault, which opens it.
 
+## Sending files to the phone
+
+Agents can send the user a file, which herdr-mobile offers to open (an APK, to install):
+
+```bash
+herdr-bridge send build/app/outputs/flutter-apk/app-release.apk --title "Debug build with the fix"
+```
+
+It reaches herdr-mobile on other devices, not the app on this machine, which already has the file. Installing the plugin puts a skill teaching agents this and `obsidian open` in `~/.claude/skills/herdr-bridge` and `~/.agents/skills/herdr-bridge` (where Codex, Gemini CLI, opencode and others look), for whichever of those folders exist; the `uninstall` pane removes it.
+
 ## Development
 
 ```bash

@@ -156,7 +156,7 @@ impl HerdrClient {
             tokio::fs::write(&path, bytes).await.map_err(|e| format!("Could not save the image: {e}"))?;
             use std::os::unix::fs::PermissionsExt;
             let _ = tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await;
-            crate::uploads::prune(dir);
+            crate::uploads::prune(dir, crate::uploads::KEEP);
             return Ok(path.to_string_lossy().into_owned());
         }
         // The remote shell parses the command line, and `command` quotes every argument; the names

@@ -12,6 +12,8 @@ RELEASES="https://github.com/XicuM/herdr-mobile/releases/latest/download"
 OS="$(uname -s)"
 ARCH="$(uname -m)"
 [[ "$ARCH" == arm64 ]] && ARCH=aarch64
+# Where agents find skills: Claude Code's own, and the shared one Codex, Gemini CLI, opencode and others read.
+SKILL_HOMES=("$HOME/.claude" "$HOME/.agents")
 
 # A herdr popup closes with its command, so leave what it printed up until it's read.
 [[ -n "${HERDR_PLUGIN_ID:-}" ]] && trap 'read -rp "Press Enter to close" _' EXIT
@@ -42,6 +44,15 @@ case "${1:-}" in
     exit 1
   fi
   echo "Installed herdr-bridge to $BIN_DIR/herdr-bridge"
+
+  # Teaches agents `herdr-bridge send` and `obsidian open`, for each agent installed: herdr has no way for a
+  # plugin to give agents instructions.
+  for home in "${SKILL_HOMES[@]}"; do
+    [[ -d "$home" ]] || continue
+    mkdir -p "$home/skills/herdr-bridge"
+    cp "$SCRIPT_DIR/skill/SKILL.md" "$home/skills/herdr-bridge/SKILL.md"
+    echo "Installed the herdr-bridge skill to $home/skills/herdr-bridge"
+  done
 
   if [[ "$OS" == Darwin ]]; then
     mkdir -p "$HOME/Library/LaunchAgents"
@@ -140,7 +151,8 @@ EOF
   # The token stays, so a phone paired with this machine pairs again after a reinstall.
   tailscale serve --tcp "$PORT" off >/dev/null 2>&1 || true
   rm -rf "$BIN_DIR/herdr-bridge" "$HOME/.local/lib/herdr-mobile" "$BIN_DIR/herdr-mobile" "$HOME/.local/share/applications/herdr-mobile.desktop"
-  echo "Removed herdr-bridge, and herdr-mobile's Linux app if it was installed; the token stays in ~/.config/herdr-bridge."
+  for home in "${SKILL_HOMES[@]}"; do rm -rf "$home/skills/herdr-bridge"; done
+  echo "Removed herdr-bridge, its agents' skill, and herdr-mobile's Linux app if it was installed; the token stays in ~/.config/herdr-bridge."
   if [[ "$OS" == Darwin ]]; then
     launchctl bootout "gui/$(id -u)/dev.herdr.bridge" 2>/dev/null || true
     rm -f "$HOME/Library/LaunchAgents/dev.herdr.bridge.plist"

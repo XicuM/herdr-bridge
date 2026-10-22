@@ -10,7 +10,7 @@ use std::time::SystemTime;
 pub const MAX_BYTES: usize = 10 * 1024 * 1024;
 
 /// How many uploads stay on disk; each upload prunes back down to this many.
-const KEEP: usize = 100;
+pub const KEEP: usize = 100;
 
 fn extension_of(mime: &str) -> Option<&'static str> {
     match mime.to_ascii_lowercase().as_str() {
@@ -62,9 +62,9 @@ pub fn to_prune(mut entries: Vec<(PathBuf, SystemTime)>, keep: usize) -> Vec<Pat
     entries.into_iter().map(|(path, _)| path).collect()
 }
 
-/// Prunes `dir` back to the newest [KEEP] uploads; failures are ignored, since a full disk of old
-/// images is untidy, not an error.
-pub fn prune(dir: PathBuf) {
+/// Prunes `dir` back to its newest `keep` files ([KEEP] uploads, [crate::deliveries::KEEP] deliveries);
+/// failures are ignored, since a full disk of old files is untidy, not an error.
+pub fn prune(dir: PathBuf, keep: usize) {
     let Ok(listing) = std::fs::read_dir(&dir) else { return };
     let entries: Vec<(PathBuf, SystemTime)> = listing
         .filter_map(|entry| entry.ok())
@@ -73,7 +73,7 @@ pub fn prune(dir: PathBuf) {
             (entry.path(), modified)
         })
         .collect();
-    for path in to_prune(entries, KEEP) {
+    for path in to_prune(entries, keep) {
         let _ = std::fs::remove_file(path);
     }
 }
