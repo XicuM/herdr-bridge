@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sets up herdr-mobile on this machine: the bridge (where herdr runs), the Linux app, and pairing a phone.
+# Sets up herdr-bridge on this machine (where herdr runs), herdr-mobile's Linux app, and pairing a phone.
 #   install.sh [--bridge] [--app] [--phone] [--lan] [--status]
 # With none of --bridge, --app, --phone or --status it asks which, or in a script sets up the bridge.
 set -euo pipefail

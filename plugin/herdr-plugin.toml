@@ -1,13 +1,13 @@
-id = "xicum.herdr-mobile"
-name = "Herdr Mobile"
+id = "xicum.herdr-bridge"
+name = "Herdr Bridge"
 version = "0.1.0"
 min_herdr_version = "0.9.5"
-description = "Set up the herdr-mobile bridge and app, and pair a phone by QR code"
+description = "Reach your agents from herdr-mobile and herdr-obsidian: set up the bridge, pair a phone by QR code, check its status"
 platforms = ["linux", "macos"]
 
 [[panes]]
 id = "setup"
-title = "Set up herdr-mobile"
+title = "Set up herdr-bridge"
 placement = "popup"
 width = "80%"
 height = "80%"

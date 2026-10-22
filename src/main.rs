@@ -16,7 +16,7 @@ use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
-#[command(name = "herdr-bridge", about = "Mobile companion bridge daemon for Herdr")]
+#[command(name = "herdr-bridge", about = "Lets other devices and apps reach your herdr agents")]
 struct Args {
     /// Path to Herdr API Unix domain socket
     #[arg(long, env = "HERDR_SOCKET", default_value_os_t = default_socket_path())]

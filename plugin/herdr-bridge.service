@@ -1,5 +1,5 @@
 [Unit]
-Description=Herdr Mobile Companion Bridge Daemon
+Description=herdr-bridge: reach herdr agents from other devices and apps
 After=network.target
 
 [Service]
