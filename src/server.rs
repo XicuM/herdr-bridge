@@ -23,7 +23,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tokio::sync::{broadcast, watch, Mutex};
-use tower_http::trace::TraceLayer;
+use tower_http::{compression::CompressionLayer, trace::TraceLayer};
 use tracing::warn;
 
 /// One machine's herdr, as the routes below see it.
@@ -34,6 +34,8 @@ pub struct AppState {
     pub snapshots: Arc<watch::Sender<Utf8Bytes>>,
     /// Notes agents ask Obsidian to show, as `/ws/session` messages (`POST /api/obsidian/open`).
     pub opens: broadcast::Sender<Utf8Bytes>,
+    /// This machine's Obsidian vaults, whose changes go to every `/ws/session`: one for all machines.
+    pub vault: Arc<crate::vault::Watcher>,
 }
 
 /// Every machine the bridge serves: its own, at `/`, and each one saved in herdr (`herdr machine list`)
@@ -60,6 +62,8 @@ pub fn create_router(local: AppState, token: String) -> Router {
         .layer(middleware::from_fn_with_state(Arc::new(token), require_token))
         .layer(middleware::from_fn(reject_browsers))
         .layer(TraceLayer::new_for_http())
+        // A vault's manifest is mostly repeated paths: gzip makes a phone's full sync an eighth the size.
+        .layer(CompressionLayer::new())
 }
 
 fn routes() -> Router {
@@ -98,6 +102,7 @@ fn routes() -> Router {
 }
 
 async fn pick_machine(State(machines): State<Machines>, mut req: Request, next: Next) -> Response {
+    let vault = machines.local.vault.clone();
     let mut machine = machines.local;
     if let Some(rest) = req.uri().path().strip_prefix("/m/") {
         let (id, rest) = rest.split_once('/').unwrap_or((rest, ""));
@@ -113,7 +118,7 @@ async fn pick_machine(State(machines): State<Machines>, mut req: Request, next: 
                 saved["session"].as_str().unwrap_or("default").into(),
             ));
             herdr.clone().start_event_listener();
-            remote.insert(id.clone(), AppState { snapshots: start_snapshot_poller(herdr.clone()), herdr, opens: broadcast::channel(16).0 });
+            remote.insert(id.clone(), AppState { snapshots: start_snapshot_poller(herdr.clone()), herdr, opens: broadcast::channel(16).0, vault });
         }
         machine = remote[&id].clone();
         drop(remote);
@@ -125,7 +130,7 @@ async fn pick_machine(State(machines): State<Machines>, mut req: Request, next: 
         if !sessions.contains_key(&session) {
             let herdr = Arc::new(HerdrClient::session(session.clone()));
             herdr.clone().start_event_listener();
-            sessions.insert(session.clone(), AppState { snapshots: start_snapshot_poller(herdr.clone()), herdr, opens: broadcast::channel(16).0 });
+            sessions.insert(session.clone(), AppState { snapshots: start_snapshot_poller(herdr.clone()), herdr, opens: broadcast::channel(16).0, vault });
         }
         machine = sessions[&session].clone();
         drop(sessions);
@@ -487,7 +492,10 @@ async fn handle_ws_session(socket: WebSocket, state: AppState) {
     let (mut sender, mut receiver) = socket.split();
     let mut snapshots = state.snapshots.subscribe();
     let mut opens = state.opens.subscribe();
+    let mut vault_changes = state.vault.changes.subscribe();
     let herdr = state.herdr.clone();
+    let vault = state.vault.clone();
+    tokio::task::spawn_blocking(move || vault.watch_vaults());
 
     let mut send_task = tokio::spawn(async move {
         // The first snapshot is fetched for this phone: the shared one is stale if none was connected.
@@ -509,6 +517,12 @@ async fn handle_ws_session(socket: WebSocket, state: AppState) {
                     text
                 }
                 open = opens.recv() => match open {
+                    Ok(text) => text,
+                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => break,
+                },
+                // A phone that fell behind misses some: its next full sync (on resume) catches up.
+                change = vault_changes.recv() => match change {
                     Ok(text) => text,
                     Err(RecvError::Lagged(_)) => continue,
                     Err(RecvError::Closed) => break,
@@ -572,8 +586,20 @@ async fn ws_term_handler(
                 warn!("Could not focus pane {}: {}", pid, e);
             }
         });
+        if let Ok(mut open) = state.herdr.open.lock() {
+            *open.entry(pane_id.clone()).or_default() += 1;
+        }
+        let pid = pane_id.clone();
         if let Err(e) = handle_ws_term(socket, &state.herdr, pane_id, size).await {
             warn!("Terminal session ended with error: {}", e);
+        }
+        if let Ok(mut open) = state.herdr.open.lock()
+            && let Some(n) = open.get_mut(&pid)
+        {
+            *n -= 1;
+            if *n == 0 {
+                open.remove(&pid);
+            }
         }
     })
     .into_response()

@@ -28,6 +28,8 @@ pub struct HerdrClient {
     /// The herdr session there, when not the default one.
     session: Option<String>,
     event_tx: broadcast::Sender<Value>,
+    /// The panes a `/ws/term` streams, and how many: only their agents' usage is read again.
+    pub open: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 /// Where the shared SSH connections' sockets go: a directory only this user can enter. ssh joins whatever
@@ -59,6 +61,7 @@ impl HerdrClient {
             machine: None,
             session: None,
             event_tx,
+            open: Default::default(),
         }
     }
 
@@ -354,11 +357,20 @@ impl HerdrClient {
             }
         }
         // Usage is this machine's account, shown for a remote machine's agents too: it's the same account
-        // everywhere. The background monitors are read from this machine's `/proc`, so only its own.
+        // everywhere. It is read again only for an agent whose pane the app has open, the only place it
+        // shows. The background monitors are read from this machine's `/proc`, so only its own.
         if let Some(agents) = snap["agents"].as_array_mut() {
-            let names: Vec<String> =
-                agents.iter().map(|a| a["agent"].as_str().or(a["name"].as_str()).unwrap_or("").to_string()).collect();
-            let usages = tokio::task::spawn_blocking(move || names.iter().map(|n| crate::usage::usage_of(n)).collect::<Vec<_>>())
+            let open = self.open.lock().map(|o| o.clone()).unwrap_or_default();
+            let names: Vec<(String, bool)> = agents
+                .iter()
+                .map(|a| {
+                    let name = a["agent"].as_str().or(a["name"].as_str()).unwrap_or("").to_string();
+                    (name, a["pane_id"].as_str().is_some_and(|p| open.contains_key(p)))
+                })
+                .collect();
+            let usages = tokio::task::spawn_blocking(move || {
+                names.iter().map(|(n, open)| crate::usage::usage_of(n, *open)).collect::<Vec<_>>()
+            })
                 .await
                 .unwrap_or_default();
             for (agent, usage) in agents.iter_mut().zip(usages) {

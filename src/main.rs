@@ -139,6 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         herdr: herdr.clone(),
         snapshots: server::start_snapshot_poller(herdr.clone()),
         opens: tokio::sync::broadcast::channel(16).0,
+        vault: vault::Watcher::new(),
     };
 
     let app = create_router(state, token);

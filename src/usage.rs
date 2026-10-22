@@ -12,51 +12,83 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Each agent's usage, and when it was read: scanning today's transcripts is too much for every 1.5 s poll.
-type Cache = HashMap<String, (Instant, Option<Value>)>;
+/// Each agent's usage, when it was read, and when its limits were: reading it is too much for every
+/// 1.5 s poll.
+type Cache = HashMap<String, (Instant, Option<Value>, Option<Instant>)>;
 static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(Default::default);
 const CACHE_TTL: Duration = Duration::from_secs(30);
+/// Limits older than this aren't shown: a provider that stops answering keeps its last ones only so long.
+const STALE: Duration = Duration::from_secs(180);
 /// The agents being read on a background thread, so a poll never starts a second read of one.
 static READING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
 
-/// Anthropic's usage endpoint answers 429 when asked every [CACHE_TTL]: when it was last asked, and its
-/// last good answer, kept while it refuses.
-type Live = (Option<Instant>, Option<(Option<String>, Vec<Value>)>);
-static CLAUDE_LIVE: LazyLock<Mutex<Live>> = LazyLock::new(Default::default);
-const CLAUDE_LIVE_TTL: Duration = Duration::from_secs(300);
-
 /// Antigravity's quota comes from running `agy`, which starts every MCP server it is configured with
-/// (hundreds of MB and seconds of CPU): when it was last run, and its last good answer.
+/// (hundreds of MB and seconds of CPU): when it was last run, and its answer.
 static AGY_LIVE: LazyLock<Mutex<(Option<Instant>, Vec<Value>)>> = LazyLock::new(Default::default);
 const AGY_LIVE_TTL: Duration = Duration::from_secs(300);
+
+/// Anthropic's usage endpoint answers 429 to a client asking every [CACHE_TTL]: when it was last asked,
+/// and its answer (None when refused), so a refusal leaves the last limits standing until [STALE].
+static CLAUDE_LIVE: LazyLock<Mutex<(Option<Instant>, Option<(Option<String>, Vec<Value>)>)>> = LazyLock::new(Default::default);
+const CLAUDE_LIVE_TTL: Duration = Duration::from_secs(60);
 
 /// Transcripts last written before this long ago hold nothing from today.
 const RECENT: Duration = Duration::from_secs(26 * 3600);
 
 /// The usage of the agent herdr calls [agent_name] as last read, or None when its files say nothing or
 /// it has not been read yet. Never waits on a read: the snapshot it goes into would stall with it, and
-/// with it every update the app gets. A stale or missing one is read again in the background.
-pub fn usage_of(agent_name: &str) -> Option<Value> {
+/// with it every update the app gets. One [open] in the app, the only place usage shows, is read again
+/// in the background when stale or missing; any other is left as it was.
+pub fn usage_of(agent_name: &str, open: bool) -> Option<Value> {
     let name = agent_name.to_lowercase();
     // Its name goes into a file name: anything but a plain name gets none.
     if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
         return None;
     }
     let cached = CACHE.lock().ok().and_then(|cache| cache.get(&name).cloned());
-    if cached.as_ref().is_none_or(|(at, _)| at.elapsed() >= CACHE_TTL)
+    if open
+        && cached.as_ref().is_none_or(|(at, ..)| at.elapsed() >= CACHE_TTL)
         && READING.lock().is_ok_and(|mut reading| reading.insert(name.clone()))
     {
         std::thread::spawn(move || {
-            let usage = read(&name);
+            let mut usage = read(&name);
+            let has_limits = |u: &Option<Value>| u.as_ref().is_some_and(|u| u["limits"].as_array().is_some_and(|l| !l.is_empty()));
+            let mut limits_at = has_limits(&usage).then(Instant::now);
             if let Ok(mut cache) = CACHE.lock() {
-                cache.insert(name.clone(), (Instant::now(), usage));
+                // A provider that didn't answer keeps its last limits until they are [STALE].
+                if limits_at.is_none()
+                    && let Some((_, old, Some(at))) = cache.get(&name)
+                    && has_limits(old)
+                {
+                    match &mut usage {
+                        Some(usage) => usage["limits"] = old.as_ref().map_or(Value::Null, |o| o["limits"].clone()),
+                        None => usage = old.clone(),
+                    }
+                    limits_at = Some(*at);
+                }
+                cache.insert(name.clone(), (Instant::now(), usage, limits_at));
             }
             if let Ok(mut reading) = READING.lock() {
                 reading.remove(&name);
             }
         });
     }
-    cached.and_then(|(_, usage)| usage)
+    // Limits read too long ago, or whose window has reset since, aren't known: they would show the old
+    // window's use. Checked on every poll, so the app hears of it at once.
+    let now = iso(SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()));
+    cached.and_then(|(_, usage, limits_at)| Some((usage?, limits_at))).map(|(mut usage, limits_at)| {
+        if let Some(limits) = usage["limits"].as_array_mut() {
+            if limits_at.is_none_or(|at| at.elapsed() >= STALE) {
+                limits.clear();
+            }
+            limits.retain(|l| {
+                !l["resets_at"].as_str().is_some_and(|r| {
+                    (r.ends_with('Z') || r.ends_with("+00:00")) && r.get(..19).is_some_and(|r| r < &now[..19])
+                })
+            });
+        }
+        usage
+    })
 }
 
 /// Reads the usage of [name] (a plain, lowercase agent name) from its files and providers.
@@ -133,15 +165,17 @@ fn claude(home: &Path) -> Option<Value> {
         }
     }
 
-    let live = CLAUDE_LIVE.lock().ok().and_then(|mut live| {
-        if live.0.is_none_or(|at| at.elapsed() >= CLAUDE_LIVE_TTL) {
-            live.0 = Some(Instant::now());
-            if let Some(got) = claude_live_limits(home) {
-                live.1 = Some(got);
+    let live = CLAUDE_LIVE
+        .lock()
+        .map(|mut live| {
+            if live.0.is_none_or(|at| at.elapsed() >= CLAUDE_LIVE_TTL) {
+                live.0 = Some(Instant::now());
+                live.1 = claude_live_limits(home);
             }
-        }
-        live.1.clone()
-    });
+            live.1.clone()
+        })
+        .ok()
+        .flatten();
     let (tier, limits) = live.or_else(|| claude_cached_limits(home)).unwrap_or_default();
 
     if tokens == 0 && prompts == 0 && limits.is_empty() && tier.is_none() && model.is_none() {
@@ -264,35 +298,38 @@ fn codex(home: &Path) -> Option<Value> {
         tokens += session_tokens;
     }
 
-    let (plan, mut limits) = codex_rpc(home).unwrap_or_else(|| {
-        codex_cached_limits(home).unwrap_or_default()
-    });
-
-    if limits.is_empty()
-        && let Some((_, log_limits)) = latest_log_limits
-    {
-        for key in ["primary", "secondary"] {
-            let w = &log_limits[key];
-            if let Some(used) = w["used_percent"].as_f64() {
-                let mins = w["window_minutes"].as_u64();
-                let label = match mins {
-                    Some(10080) => "Weekly (7-day)".to_string(),
-                    Some(43200) => "Monthly".to_string(),
-                    Some(m) if m % 60 == 0 => format!("{}-hour window", m / 60),
-                    Some(m) => format!("{m}-minute window"),
-                    None => "Rate limit".to_string(),
-                };
-                let resets_at = w["resets_at"].as_u64().map(iso).or_else(|| {
-                    let secs = w["resets_in_seconds"].as_u64()?;
-                    Some(iso(SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() + secs))
-                });
-                limits.push(json!({
-                    "label": label,
-                    "percent": used / 100.0,
-                    "resets_at": resets_at,
-                }));
-            }
+    // Its windows as the usage endpoint gives them now, else as its logs last recorded them.
+    let live = codex_live(home);
+    let mut plan = live.as_ref().and_then(|(plan, _)| plan.clone());
+    let windows = live.map(|(_, w)| w).or(latest_log_limits.map(|(_, l)| l)).unwrap_or_default();
+    let mut limits = Vec::new();
+    for key in ["primary", "secondary"] {
+        let w = &windows[key];
+        if let Some(used) = w["used_percent"].as_f64() {
+            let mins = w["window_minutes"].as_u64();
+            let label = match mins {
+                Some(10080) => "Weekly (7-day)".to_string(),
+                Some(43200) => "Monthly".to_string(),
+                Some(m) if m % 60 == 0 => format!("{}-hour window", m / 60),
+                Some(m) => format!("{m}-minute window"),
+                None => "Rate limit".to_string(),
+            };
+            let resets_at = w["resets_at"].as_u64().map(iso).or_else(|| {
+                let secs = w["resets_in_seconds"].as_u64()?;
+                Some(iso(SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() + secs))
+            });
+            limits.push(json!({
+                "label": label,
+                "percent": used / 100.0,
+                "resets_at": resets_at,
+            }));
         }
+    }
+    if limits.is_empty()
+        && let Some((cached_plan, cached)) = codex_cached_limits(home)
+    {
+        plan = plan.or(cached_plan);
+        limits = cached;
     }
 
     if tokens == 0 && prompts == 0 && limits.is_empty() && plan.is_none() && model.is_none() {
@@ -302,71 +339,37 @@ fn codex(home: &Path) -> Option<Value> {
     Some(json!({ "tier_label": final_tier, "limits": limits, "today_tokens": tokens, "today_prompts": prompts }))
 }
 
-fn codex_rpc(home: &Path) -> Option<(Option<String>, Vec<Value>)> {
-    if !home.join(".codex").exists() {
+/// Codex's usage endpoint, asked with its login: its plan, and its windows in the shape its logs record
+/// them. Codex renews that login when it runs; an expired one gets no answer.
+fn codex_live(home: &Path) -> Option<(Option<String>, Value)> {
+    let auth: Value = serde_json::from_str(&std::fs::read_to_string(home.join(".codex/auth.json")).ok()?).ok()?;
+    let tokens = &auth["tokens"];
+    let resp = curl_get("https://chatgpt.com/backend-api/wham/usage", &[
+        ("Authorization", &format!("Bearer {}", tokens["access_token"].as_str()?)),
+        ("ChatGPT-Account-Id", tokens["account_id"].as_str().unwrap_or_default()),
+        ("User-Agent", "codex_cli_rs"),
+        ("Accept", "application/json"),
+    ])?;
+    let limits = &resp["rate_limit"];
+    // An error has none: not an answer.
+    if !limits.is_object() {
         return None;
     }
-    let mut cmd = std::process::Command::new("codex");
-    cmd.args(["-s", "read-only", "-a", "never", "app-server"])
-        .env("CODEX_HOME", home.join(".codex"))
-        .env("HOME", home)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
-    let mut child = cmd.spawn().ok()?;
-
-    let result = (|| {
-        let mut stdin = child.stdin.take()?;
-        let stdout = child.stdout.take()?;
-
-        let _ = writeln!(stdin, "{}", json!({"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "herdr-bridge", "version": "1"}}}));
-        let _ = writeln!(stdin, "{}", json!({"method": "initialized", "params": {}}));
-        let _ = writeln!(stdin, "{}", json!({"id": 2, "method": "account/rateLimits/read"}));
-        let _ = stdin.flush();
-
-        let reader = BufReader::new(stdout);
-        for line in reader.lines().map_while(Result::ok) {
-            if let Ok(msg) = serde_json::from_str::<Value>(&line)
-                && msg["id"] == 2
-            {
-                return Some(msg);
-            }
-        }
-        None
-    })();
-
-    let _ = child.kill();
-    let _ = child.wait();
-    let msg = result?;
-    let limits_obj = &msg["result"]["rateLimits"];
-    let plan = limits_obj["planType"].as_str().map(|p| {
+    let plan = resp["plan_type"].as_str().map(|p| {
         let mut c = p.chars();
         match c.next() {
             None => String::new(),
             Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
         }
     });
-    let mut limits = Vec::new();
-    for key in ["primary", "secondary"] {
-        let w = &limits_obj[key];
-        if let Some(used) = w["usedPercent"].as_f64() {
-            let mins = w["windowDurationMins"].as_u64();
-            let label = match mins {
-                Some(10080) => "Weekly (7-day)".to_string(),
-                Some(43200) => "Monthly".to_string(),
-                Some(m) if m % 60 == 0 => format!("{}-hour window", m / 60),
-                Some(m) => format!("{m}-minute window"),
-                None => "Rate limit".to_string(),
-            };
-            let resets_at = w["resetsAt"].as_u64().map(iso);
-            limits.push(json!({
-                "label": label,
-                "percent": used / 100.0,
-                "resets_at": resets_at,
-            }));
-        }
-    }
-    Some((plan, limits))
+    let window = |w: &Value| {
+        json!({
+            "used_percent": w["used_percent"],
+            "window_minutes": w["limit_window_seconds"].as_u64().map(|s| s / 60),
+            "resets_at": w["reset_at"],
+        })
+    };
+    Some((plan, json!({ "primary": window(&limits["primary_window"]), "secondary": window(&limits["secondary_window"]) })))
 }
 
 fn codex_cached_limits(home: &Path) -> Option<(Option<String>, Vec<Value>)> {
@@ -456,10 +459,7 @@ fn antigravity(home: &Path) -> Option<Value> {
         .map(|mut live| {
             if live.0.is_none_or(|at| at.elapsed() >= AGY_LIVE_TTL) {
                 live.0 = Some(Instant::now());
-                let got = antigravity_probe(home);
-                if !got.is_empty() {
-                    live.1 = got;
-                }
+                live.1 = antigravity_probe(home);
             }
             live.1.clone()
         })
@@ -959,12 +959,14 @@ fn cache_json(home: &Path, names: &[&str]) -> Option<Value> {
         home.join(".local/state/omarchy/agents/usage"),
         home.join(".local/state/herdr/usage"),
     ];
-    // The newest of them: a tool no longer running leaves its last numbers behind.
+    // The newest of them, and only if written lately: a tool no longer running leaves its last numbers
+    // behind, and a window with no use yet has no `resets_at` to expire them by.
     let newest = state_dirs
         .iter()
         .flat_map(|dir| names.iter().flat_map(move |name| [dir.join(name).join("usage.json"), dir.join(format!("{name}.json"))]))
         .filter_map(|p| Some((std::fs::metadata(&p).ok()?.modified().ok()?, p)))
-        .max_by_key(|(at, _)| *at)?;
+        .max_by_key(|(at, _)| *at)
+        .filter(|(at, _)| at.elapsed().is_ok_and(|e| e < STALE))?;
     serde_json::from_str(&std::fs::read_to_string(newest.1).ok()?).ok()
 }
 
@@ -1302,8 +1304,8 @@ mod tests {
 
     #[test]
     fn names_that_are_not_plain_get_nothing() {
-        assert_eq!(usage_of("../../etc/passwd"), None);
-        assert_eq!(usage_of("a/b"), None);
+        assert_eq!(usage_of("../../etc/passwd", true), None);
+        assert_eq!(usage_of("a/b", true), None);
     }
 
     #[test]
