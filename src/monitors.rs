@@ -297,8 +297,17 @@ mod tests {
         let is_ours = |procs: &HashMap<u32, Proc>| {
             procs.values().any(|p| p.ppid == me && p.cmdline.starts_with("sleep"))
         };
-        let procs = read_procs();
-        assert!(is_ours(&procs));
+        // Some CI runners show the child in `/proc` a moment after `spawn` returns: give it up to 2 s.
+        let mut procs = read_procs();
+        for _ in 0..40 {
+            if is_ours(&procs) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            procs = read_procs();
+        }
+        let children: Vec<_> = procs.iter().filter(|(_, p)| p.ppid == me).map(|(pid, p)| (pid, &p.cmdline)).collect();
+        assert!(is_ours(&procs), "no `sleep` among this process's children: {children:?}");
         assert!(has_monitors(&procs, me, "test-agent"));
         child.kill().unwrap();
         let _ = child.wait();
