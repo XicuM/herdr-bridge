@@ -142,6 +142,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         vault: vault::Watcher::new(),
     };
 
+    // Installed as a herdr plugin, the bridge removes itself once herdr no longer lists the plugin: herdr runs
+    // nothing on `herdr plugin uninstall`. Only a list herdr answered counts, never herdr being down.
+    if let Ok(plugin) = std::env::var("HERDR_BRIDGE_PLUGIN") {
+        let herdr = herdr.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                let Ok(list) = herdr.call("plugin.list", serde_json::json!({})).await else { continue };
+                let Some(plugins) = list["plugins"].as_array() else { continue };
+                if plugins.iter().any(|p| p["plugin_id"] == plugin.as_str()) {
+                    continue;
+                }
+                info!("The {plugin} plugin was uninstalled; removing the bridge");
+                // It stops this service last, ending the bridge with it.
+                let script = std::env::var("HOME").unwrap_or_default() + "/.local/lib/herdr-bridge/install.sh";
+                let _ = tokio::process::Command::new("bash").arg(script).arg("--uninstall").status().await;
+                std::process::exit(0);
+            }
+        });
+    }
+
     let app = create_router(state, token);
 
     // An IPv6 bind needs no brackets this way.

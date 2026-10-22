@@ -13,24 +13,27 @@ The routes and events clients rely on are in [PROTOCOL.md](PROTOCOL.md).
 
 ## Install
 
-Grab `herdr-bridge-linux-{x86_64,aarch64}` from [Releases](https://github.com/XicuM/herdr-bridge/releases), or build it (Rust 2024 edition):
+It installs as a [herdr plugin](https://herdr.dev/docs/plugins/) (herdr 0.9.5 or later, Linux or macOS):
 
 ```bash
-cargo build --release
-./plugin/install.sh             # asks what to set up: the bridge, herdr-mobile's Linux app, or pairing a phone
+herdr plugin install XicuM/herdr-bridge     # installs the bridge and starts it
+herdr plugin update xicum.herdr-bridge      # updates it
+herdr plugin uninstall xicum.herdr-bridge   # the bridge removes itself within a minute
 ```
 
-Or install it as a herdr plugin, which does the same and keeps it updated with `herdr plugin update`:
+Installing puts `herdr-bridge` in `~/.local/bin/`, makes a token at `~/.config/herdr-bridge/token`, and starts a user service (systemd on Linux and WSL2, launchd on macOS). It needs no root. Linux gets the release's binary; macOS, or a failed download, needs [Rust](https://rustup.rs) to build it. The bridge listens on `127.0.0.1:7788`, and the installer brings your tailnet to it with `tailscale serve`.
 
-```bash
-herdr plugin install XicuM/herdr-bridge
-```
+Uninstalling stops the service and removes the bridge and herdr-mobile's Linux app. The token stays, so a phone you paired pairs again after a reinstall; delete `~/.config/herdr-bridge` to forget it.
 
-Its popups then set up herdr-mobile's Linux app or a phone, pair a phone by QR code, and show the bridge's status (`herdr plugin pane open --plugin xicum.herdr-bridge --entrypoint setup`, `pair` or `status`).
+The plugin's popups (`herdr plugin pane open --plugin xicum.herdr-bridge --entrypoint <pane>`):
 
-herdr runs nothing on `herdr plugin uninstall`, so remove the bridge first: open the `uninstall` pane, or run `./plugin/install.sh --uninstall`. It stops and removes the service, the binary and herdr-mobile's Linux app, and keeps the token in `~/.config/herdr-bridge`.
+| Pane | What it does |
+| --- | --- |
+| `pair` | QR codes for the Android app and for pairing it with this machine's bridge (`qrencode` draws them). |
+| `app` | Installs herdr-mobile's Linux app. |
+| `status` | The service's status, its last log lines and `tailscale serve`. |
 
-The installer puts `herdr-bridge` in `~/.local/bin/`, makes a token at `~/.config/herdr-bridge/token`, and starts a user service (systemd on Linux and WSL2, launchd on macOS). It needs no root. The bridge listens on `127.0.0.1:7788`, and the installer brings your tailnet to it with `tailscale serve`. Without Tailscale, `./plugin/install.sh --bridge --lan` opens it to every network the machine is on instead; the token then crosses the network in clear text, so only do this on networks you trust.
+Without Tailscale, open the bridge to every network the machine is on with `systemctl --user edit herdr-bridge`, adding `[Service]` and `Environment=HERDR_BRIDGE_BIND=0.0.0.0`, then `herdr plugin update xicum.herdr-bridge`. The token then crosses the network in clear text, so only do this on networks you trust.
 
 ```bash
 herdr-bridge --print-token                      # the token clients must send
@@ -43,7 +46,7 @@ RUST_LOG=herdr_bridge=debug herdr-bridge --port 7788   # foreground, debug logs
 
 - Every request but `/health` needs `Authorization: Bearer <token>`. A wrong token is answered after a second, one at a time, so 8 characters can't be guessed.
 - Requests with an `Origin` header are refused, and so is a `Host` that is a dotted name other than `*.ts.net`: no web page can drive the bridge, even through DNS rebinding.
-- It listens on `127.0.0.1`, so only this machine and your tailnet (through `tailscale serve`) reach it. `--lan` opens it to your local network, where the token is sent unencrypted. Direct internet exposure is neither needed nor recommended.
+- It listens on `127.0.0.1`, so only this machine and your tailnet (through `tailscale serve`) reach it. Binding `0.0.0.0` opens it to your local network, where the token is sent unencrypted. Direct internet exposure is neither needed nor recommended.
 
 ## Obsidian
 
@@ -63,6 +66,8 @@ The path is relative to the agent's directory and must be inside a vault Obsidia
 cargo check
 cargo test
 cargo build --release
+# run a build in place of the installed bridge
+install -m 755 target/release/herdr-bridge ~/.local/bin/ && systemctl --user restart herdr-bridge
 ```
 
 ## License

@@ -9,7 +9,7 @@
         <string>/bin/bash</string>
         <string>-c</string>
         <!-- Logs go to the user's own Library rather than the shared /tmp: they name panes and workspaces. -->
-        <string>mkdir -p "$HOME/Library/Logs"; PATH="$HOME/.local/bin:$HOME/bin:/usr/local/bin:/opt/homebrew/bin:$PATH" exec "$HOME/.local/bin/start-bridge.sh" &gt;&gt;"$HOME/Library/Logs/herdr-bridge.log" 2&gt;&amp;1</string>
+        <string>mkdir -p "$HOME/Library/Logs"; PATH="$HOME/.local/bin:$HOME/bin:/usr/local/bin:/opt/homebrew/bin:$PATH" exec "$HOME/.local/bin/herdr-bridge" &gt;&gt;"$HOME/Library/Logs/herdr-bridge.log" 2&gt;&amp;1</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -19,6 +19,10 @@
     <dict>
         <key>RUST_LOG</key>
         <string>herdr_bridge=info,tower_http=info</string>
+        <key>HERDR_BRIDGE_BIND</key>
+        <string>127.0.0.1</string>
+        <key>HERDR_BRIDGE_PLUGIN</key>
+        <string>xicum.herdr-bridge</string>
     </dict>
 </dict>
 </plist>
