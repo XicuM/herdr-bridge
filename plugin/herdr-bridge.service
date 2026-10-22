@@ -10,8 +10,6 @@ RestartSec=3
 Environment=RUST_LOG=herdr_bridge=info,tower_http=info
 # This machine only: `tailscale serve` brings the tailnet here. `systemctl --user edit herdr-bridge` can set 0.0.0.0.
 Environment=HERDR_BRIDGE_BIND=127.0.0.1
-# Installed by the herdr plugin: the bridge removes itself once herdr no longer lists it.
-Environment=HERDR_BRIDGE_PLUGIN=xicum.herdr-bridge
 # The bridge runs `herdr` and `git`; a user unit's default PATH misses user installs.
 Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
 

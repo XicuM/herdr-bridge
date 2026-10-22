@@ -21,8 +21,6 @@
         <string>herdr_bridge=info,tower_http=info</string>
         <key>HERDR_BRIDGE_BIND</key>
         <string>127.0.0.1</string>
-        <key>HERDR_BRIDGE_PLUGIN</key>
-        <string>xicum.herdr-bridge</string>
     </dict>
 </dict>
 </plist>

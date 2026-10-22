@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # The herdr plugin's commands (herdr-plugin.toml): installing or updating the plugin runs --bridge, its panes
-# --app, --phone and --status, and the bridge runs --uninstall itself once the plugin is uninstalled.
+# --app, --phone, --status and --uninstall (herdr runs nothing on `herdr plugin uninstall`).
 #   install.sh --bridge | --app | --phone | --status | --uninstall
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="$HOME/.local/bin"
-LIB_DIR="$HOME/.local/lib/herdr-bridge"
 PORT=7788
 # The app and the APK are released by herdr-mobile.
 RELEASES="https://github.com/XicuM/herdr-mobile/releases/latest/download"
@@ -24,7 +23,7 @@ BIND=127.0.0.1
 
 case "${1:-}" in
 --bridge)
-  mkdir -p "$BIN_DIR" "$LIB_DIR"
+  mkdir -p "$BIN_DIR"
   # The release of the version this checkout is: "latest" can lag a new release, or run ahead of an old checkout.
   VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$SCRIPT_DIR/../Cargo.toml" | head -n1)"
   # The release's binary, else a build from source (a download can fail).
@@ -42,9 +41,6 @@ case "${1:-}" in
     echo "Error: no herdr-bridge binary for $OS; install Rust (cargo) to build it." >&2
     exit 1
   fi
-  # herdr may prune the plugin's files once it is uninstalled, and the bridge runs this then.
-  install -m 755 "$SCRIPT_DIR/install.sh" "$LIB_DIR/install.sh"
-  rm -f "$BIN_DIR/start-bridge.sh" # The wrapper earlier versions started the bridge through.
   echo "Installed herdr-bridge to $BIN_DIR/herdr-bridge"
 
   if [[ "$OS" == Darwin ]]; then
@@ -141,20 +137,17 @@ EOF
   ;;
 
 --uninstall)
-  # The bridge runs this from its own service, so the service is stopped last: that ends this script too.
   # The token stays, so a phone paired with this machine pairs again after a reinstall.
   tailscale serve --tcp "$PORT" off >/dev/null 2>&1 || true
-  rm -rf "$BIN_DIR/herdr-bridge" "$BIN_DIR/start-bridge.sh" "$LIB_DIR" \
-    "$HOME/.local/lib/herdr-mobile" "$BIN_DIR/herdr-mobile" "$HOME/.local/share/applications/herdr-mobile.desktop"
+  rm -rf "$BIN_DIR/herdr-bridge" "$HOME/.local/lib/herdr-mobile" "$BIN_DIR/herdr-mobile" "$HOME/.local/share/applications/herdr-mobile.desktop"
   echo "Removed herdr-bridge, and herdr-mobile's Linux app if it was installed; the token stays in ~/.config/herdr-bridge."
   if [[ "$OS" == Darwin ]]; then
-    rm -f "$HOME/Library/LaunchAgents/dev.herdr.bridge.plist"
     launchctl bootout "gui/$(id -u)/dev.herdr.bridge" 2>/dev/null || true
+    rm -f "$HOME/Library/LaunchAgents/dev.herdr.bridge.plist"
   else
-    systemctl --user disable herdr-bridge.service 2>/dev/null || true
+    systemctl --user disable --now herdr-bridge.service 2>/dev/null || true
     rm -rf "$HOME/.config/systemd/user/herdr-bridge.service" "$HOME/.config/systemd/user/herdr-bridge.service.d"
     systemctl --user daemon-reload
-    systemctl --user stop herdr-bridge.service 2>/dev/null || true
   fi
   ;;
 

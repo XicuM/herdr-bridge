@@ -18,12 +18,18 @@ It installs as a [herdr plugin](https://herdr.dev/docs/plugins/) (herdr 0.9.5 or
 ```bash
 herdr plugin install XicuM/herdr-bridge     # installs the bridge and starts it
 herdr plugin update xicum.herdr-bridge      # updates it
-herdr plugin uninstall xicum.herdr-bridge   # the bridge removes itself within seconds
 ```
 
 Installing puts `herdr-bridge` in `~/.local/bin/`, makes a token at `~/.config/herdr-bridge/token`, and starts a user service (systemd on Linux and WSL2, launchd on macOS). It needs no root. It downloads the release's binary (Linux, static so any distribution runs it, and macOS, x86_64 and arm64), and only when that fails builds it with [Rust](https://rustup.rs). The bridge listens on `127.0.0.1:7788`, and the installer brings your tailnet to it with `tailscale serve`.
 
-`herdr plugin disable xicum.herdr-bridge` stops the bridge serving (its port closes) and `enable` starts it again. Uninstalling stops the service and removes the bridge and herdr-mobile's Linux app. The token stays, so a phone you paired pairs again after a reinstall; delete `~/.config/herdr-bridge` to forget it.
+herdr runs nothing when a plugin is uninstalled or disabled, so remove the bridge before uninstalling the plugin:
+
+```bash
+herdr plugin pane open --plugin xicum.herdr-bridge --entrypoint uninstall
+herdr plugin uninstall xicum.herdr-bridge
+```
+
+That stops the service and removes the bridge and herdr-mobile's Linux app. The token stays, so a phone you paired pairs again after a reinstall; delete `~/.config/herdr-bridge` to forget it. Disabling the plugin leaves the bridge running.
 
 The plugin's popups (`herdr plugin pane open --plugin xicum.herdr-bridge --entrypoint <pane>`):
 
@@ -32,6 +38,7 @@ The plugin's popups (`herdr plugin pane open --plugin xicum.herdr-bridge --entry
 | `pair` | QR codes for the Android app and for pairing it with this machine's bridge (`qrencode` draws them). |
 | `app` | Installs herdr-mobile's Linux app. |
 | `status` | The service's status, its last log lines and `tailscale serve`. |
+| `uninstall` | Stops and removes the bridge, before `herdr plugin uninstall`. |
 
 Without Tailscale, open the bridge to every network the machine is on with `systemctl --user edit herdr-bridge`, adding `[Service]` and `Environment=HERDR_BRIDGE_BIND=0.0.0.0`, then `herdr plugin update xicum.herdr-bridge`. The token then crosses the network in clear text, so only do this on networks you trust.
 

@@ -1,12 +1,12 @@
 id = "xicum.herdr-bridge"
 name = "Herdr Bridge"
-version = "0.3.0"
+version = "0.3.1"
 min_herdr_version = "0.9.5"
 description = "Reach your agents from herdr-mobile and herdr-obsidian: runs the bridge, pairs a phone by QR code"
 platforms = ["linux", "macos"]
 
-# Installing or updating the plugin installs the bridge and starts its service. herdr runs nothing on uninstall,
-# so the bridge watches for it and removes itself (HERDR_BRIDGE_PLUGIN in its service).
+# Installing or updating the plugin installs the bridge and starts its service. herdr runs nothing on uninstall
+# or disable, so the uninstall pane removes it.
 [[build]]
 command = ["bash", "plugin/install.sh", "--bridge"]
 
@@ -35,3 +35,11 @@ width = "90%"
 height = "80%"
 command = ["bash", "plugin/install.sh", "--status"]
 
+
+[[panes]]
+id = "uninstall"
+title = "Uninstall bridge"
+placement = "popup"
+width = "80%"
+height = "60%"
+command = ["bash", "plugin/install.sh", "--uninstall"]
