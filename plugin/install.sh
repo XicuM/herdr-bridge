@@ -8,8 +8,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="$HOME/.local/bin"
 LIB_DIR="$HOME/.local/lib/herdr-bridge"
 PORT=7788
-# The bridge is released here, the app and the APK by herdr-mobile.
-BRIDGE_RELEASES="https://github.com/XicuM/herdr-bridge/releases/latest/download"
+# The bridge is released here, as the version this checkout is (never "latest", which can lag a new release or
+# run ahead of an older checkout); the app and the APK by herdr-mobile.
+VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$SCRIPT_DIR/../Cargo.toml" | head -n1)"
+BRIDGE_RELEASES="https://github.com/XicuM/herdr-bridge/releases/download/v$VERSION"
 RELEASES="https://github.com/XicuM/herdr-mobile/releases/latest/download"
 OS="$(uname -s)"
 ARCH="$(uname -m)"
@@ -27,7 +29,7 @@ case "${1:-}" in
 --bridge)
   mkdir -p "$BIN_DIR" "$LIB_DIR"
   # The release's binary, else a build from source (macOS has no release binary, and a download can fail).
-  if [[ "$OS" == Linux ]] && echo "Downloading herdr-bridge for $ARCH..." &&
+  if [[ "$OS" == Linux ]] && echo "Downloading herdr-bridge $VERSION for $ARCH..." &&
     curl -fL --progress-bar -o "$BIN_DIR/herdr-bridge.new" "$BRIDGE_RELEASES/herdr-bridge-linux-$ARCH"; then
     chmod 755 "$BIN_DIR/herdr-bridge.new"
     mv "$BIN_DIR/herdr-bridge.new" "$BIN_DIR/herdr-bridge"

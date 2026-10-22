@@ -1,6 +1,6 @@
 id = "xicum.herdr-bridge"
 name = "Herdr Bridge"
-version = "0.2.0"
+version = "0.2.1"
 min_herdr_version = "0.9.5"
 description = "Reach your agents from herdr-mobile and herdr-obsidian: runs the bridge, pairs a phone by QR code"
 platforms = ["linux", "macos"]
