@@ -1,9 +1,13 @@
 id = "xicum.herdr-bridge"
 name = "Herdr Bridge"
-version = "0.1.0"
+version = "0.1.1"
 min_herdr_version = "0.9.5"
 description = "Reach your agents from herdr-mobile and herdr-obsidian: set up the bridge, pair a phone by QR code, check its status"
 platforms = ["linux", "macos"]
+
+# Installing the plugin installs the bridge and starts its service; `herdr plugin update` updates it.
+[[build]]
+command = ["bash", "plugin/install.sh", "--bridge"]
 
 [[panes]]
 id = "setup"
@@ -11,7 +15,7 @@ title = "Set up herdr-bridge"
 placement = "popup"
 width = "80%"
 height = "80%"
-command = ["bash", "install.sh"]
+command = ["bash", "plugin/install.sh"]
 
 [[panes]]
 id = "pair"
@@ -19,7 +23,7 @@ title = "Pair phone"
 placement = "popup"
 width = "80%"
 height = "90%"
-command = ["bash", "install.sh", "--phone"]
+command = ["bash", "plugin/install.sh", "--phone"]
 
 [[panes]]
 id = "status"
@@ -27,4 +31,4 @@ title = "Bridge status"
 placement = "popup"
 width = "90%"
 height = "80%"
-command = ["bash", "install.sh", "--status"]
+command = ["bash", "plugin/install.sh", "--status"]
