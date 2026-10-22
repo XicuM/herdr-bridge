@@ -1,0 +1,30 @@
+id = "xicum.herdr-mobile"
+name = "Herdr Mobile"
+version = "0.1.0"
+min_herdr_version = "0.9.5"
+description = "Set up the herdr-mobile bridge and app, and pair a phone by QR code"
+platforms = ["linux", "macos"]
+
+[[panes]]
+id = "setup"
+title = "Set up herdr-mobile"
+placement = "popup"
+width = "80%"
+height = "80%"
+command = ["bash", "install.sh"]
+
+[[panes]]
+id = "pair"
+title = "Pair phone"
+placement = "popup"
+width = "80%"
+height = "90%"
+command = ["bash", "install.sh", "--phone"]
+
+[[panes]]
+id = "status"
+title = "Bridge status"
+placement = "popup"
+width = "90%"
+height = "80%"
+command = ["bash", "install.sh", "--status"]

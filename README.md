@@ -17,10 +17,12 @@ Grab `herdr-bridge-linux-{x86_64,aarch64}` from [Releases](https://github.com/Xi
 
 ```bash
 cargo build --release
-./deploy/install.sh
+./plugin/install.sh             # asks what to set up: the bridge, herdr-mobile's Linux app, or pairing a phone
 ```
 
-The installer puts `herdr-bridge` in `~/.local/bin/`, makes a token at `~/.config/herdr-bridge/token`, and starts a user service (systemd on Linux and WSL2, launchd on macOS). It needs no root. The bridge listens on `127.0.0.1:7788`, and the installer brings your tailnet to it with `tailscale serve`. Without Tailscale, `./deploy/install.sh --lan` opens it to every network the machine is on instead; the token then crosses the network in clear text, so only do this on networks you trust.
+It is also a herdr plugin, whose popups run the installer, pair a phone by QR code and show the bridge's status: `herdr plugin install XicuM/herdr-bridge/plugin`.
+
+The installer puts `herdr-bridge` in `~/.local/bin/`, makes a token at `~/.config/herdr-bridge/token`, and starts a user service (systemd on Linux and WSL2, launchd on macOS). It needs no root. The bridge listens on `127.0.0.1:7788`, and the installer brings your tailnet to it with `tailscale serve`. Without Tailscale, `./plugin/install.sh --bridge --lan` opens it to every network the machine is on instead; the token then crosses the network in clear text, so only do this on networks you trust.
 
 ```bash
 herdr-bridge --print-token                      # the token clients must send
