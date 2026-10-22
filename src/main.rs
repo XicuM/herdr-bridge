@@ -12,7 +12,7 @@ use server::{create_router, AppState};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
@@ -157,8 +157,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 info!("The {plugin} plugin was uninstalled; removing the bridge");
                 // It stops this service last, ending the bridge with it.
                 let script = std::env::var("HOME").unwrap_or_default() + "/.local/lib/herdr-bridge/install.sh";
-                let _ = tokio::process::Command::new("bash").arg(script).arg("--uninstall").status().await;
-                std::process::exit(0);
+                match tokio::process::Command::new("bash").arg(&script).arg("--uninstall").status().await {
+                    Ok(status) if status.success() => std::process::exit(0),
+                    // Exiting would only have the service start it again: it keeps serving, and tries again.
+                    result => warn!("{script} --uninstall failed: {result:?}"),
+                }
             }
         });
     }
