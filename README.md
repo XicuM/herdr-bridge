@@ -18,12 +18,12 @@ It installs as a [herdr plugin](https://herdr.dev/docs/plugins/) (herdr 0.9.5 or
 ```bash
 herdr plugin install XicuM/herdr-bridge     # installs the bridge and starts it
 herdr plugin update xicum.herdr-bridge      # updates it
-herdr plugin uninstall xicum.herdr-bridge   # the bridge removes itself within a minute
+herdr plugin uninstall xicum.herdr-bridge   # the bridge removes itself within seconds
 ```
 
-Installing puts `herdr-bridge` in `~/.local/bin/`, makes a token at `~/.config/herdr-bridge/token`, and starts a user service (systemd on Linux and WSL2, launchd on macOS). It needs no root. Linux gets the release's binary; macOS, or a failed download, needs [Rust](https://rustup.rs) to build it. The bridge listens on `127.0.0.1:7788`, and the installer brings your tailnet to it with `tailscale serve`.
+Installing puts `herdr-bridge` in `~/.local/bin/`, makes a token at `~/.config/herdr-bridge/token`, and starts a user service (systemd on Linux and WSL2, launchd on macOS). It needs no root. It downloads the release's binary (Linux, static so any distribution runs it, and macOS, x86_64 and arm64), and only when that fails builds it with [Rust](https://rustup.rs). The bridge listens on `127.0.0.1:7788`, and the installer brings your tailnet to it with `tailscale serve`.
 
-Uninstalling stops the service and removes the bridge and herdr-mobile's Linux app. The token stays, so a phone you paired pairs again after a reinstall; delete `~/.config/herdr-bridge` to forget it.
+`herdr plugin disable xicum.herdr-bridge` stops the bridge serving (its port closes) and `enable` starts it again. Uninstalling stops the service and removes the bridge and herdr-mobile's Linux app. The token stays, so a phone you paired pairs again after a reinstall; delete `~/.config/herdr-bridge` to forget it.
 
 The plugin's popups (`herdr plugin pane open --plugin xicum.herdr-bridge --entrypoint <pane>`):
 

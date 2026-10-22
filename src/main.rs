@@ -132,26 +132,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let herdr = Arc::new(HerdrClient::new(args.socket));
 
-    // Start background event listener
-    herdr.clone().start_event_listener();
-
-    let state = AppState {
-        herdr: herdr.clone(),
-        snapshots: server::start_snapshot_poller(herdr.clone()),
-        opens: tokio::sync::broadcast::channel(16).0,
-        vault: vault::Watcher::new(),
-    };
-
-    // Installed as a herdr plugin, the bridge removes itself once herdr no longer lists the plugin: herdr runs
-    // nothing on `herdr plugin uninstall`. Only a list herdr answered counts, never herdr being down.
+    // Installed as a herdr plugin, the bridge follows the plugin, since herdr runs nothing when it changes: it
+    // pauses while the plugin is disabled, and removes itself once herdr no longer lists it. Only a list herdr
+    // answered counts, never herdr being down.
+    let paused = std::env::var_os("HERDR_BRIDGE_PAUSED").is_some();
     if let Ok(plugin) = std::env::var("HERDR_BRIDGE_PLUGIN") {
         let herdr = herdr.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 let Ok(list) = herdr.call("plugin.list", serde_json::json!({})).await else { continue };
                 let Some(plugins) = list["plugins"].as_array() else { continue };
-                if plugins.iter().any(|p| p["plugin_id"] == plugin.as_str()) {
+                if let Some(p) = plugins.iter().find(|p| p["plugin_id"] == plugin.as_str()) {
+                    if (p["enabled"] != false) == paused {
+                        // Started again in place: a paused bridge holds no port and no connection, and the
+                        // service, which would only restart an exited one, never notices.
+                        info!("The {plugin} plugin was {}", if paused { "enabled; serving again" } else { "disabled; pausing" });
+                        let mut argv = std::env::args_os();
+                        let mut cmd = std::process::Command::new(argv.next().unwrap_or_default());
+                        cmd.args(argv);
+                        if paused { cmd.env_remove("HERDR_BRIDGE_PAUSED") } else { cmd.env("HERDR_BRIDGE_PAUSED", "1") };
+                        use std::os::unix::process::CommandExt;
+                        warn!("Could not restart herdr-bridge: {}", cmd.exec());
+                    }
                     continue;
                 }
                 info!("The {plugin} plugin was uninstalled; removing the bridge");
@@ -165,6 +168,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+    if paused {
+        info!("Paused while the herdr plugin is disabled");
+        std::future::pending::<()>().await;
+    }
+
+    // Start background event listener
+    herdr.clone().start_event_listener();
+
+    let state = AppState {
+        herdr: herdr.clone(),
+        snapshots: server::start_snapshot_poller(herdr.clone()),
+        opens: tokio::sync::broadcast::channel(16).0,
+        vault: vault::Watcher::new(),
+    };
 
     let app = create_router(state, token);
 

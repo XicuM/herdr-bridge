@@ -12,11 +12,22 @@ jobs:
   build:
     strategy:
       matrix:
+        # Linux is linked statically (musl), so one binary runs on any distribution.
         include:
           - runner: ubuntu-22.04
-            arch: x86_64
+            target: x86_64-unknown-linux-musl
+            asset: herdr-bridge-linux-x86_64
           - runner: ubuntu-22.04-arm
-            arch: aarch64
+            target: aarch64-unknown-linux-musl
+            asset: herdr-bridge-linux-aarch64
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            asset: herdr-bridge-macos-aarch64
+          # Cross-built on the arm runner, so its tests don't run.
+          - runner: macos-14
+            target: x86_64-apple-darwin
+            asset: herdr-bridge-macos-x86_64
+            cross: true
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: write
@@ -26,22 +37,25 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Test
+        if: ${{ !matrix.cross }}
         run: cargo test --locked
 
       - name: Build Bridge
         run: |
-          cargo build --release --locked
-          cp target/release/herdr-bridge herdr-bridge-linux-${{ matrix.arch }}
+          if [[ "${{ matrix.target }}" == *musl ]]; then sudo apt-get update -q && sudo apt-get install -yq musl-tools; fi
+          rustup target add ${{ matrix.target }}
+          cargo build --release --locked --target ${{ matrix.target }}
+          cp target/${{ matrix.target }}/release/herdr-bridge ${{ matrix.asset }}
 
       - name: Upload Bridge Artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: herdr-bridge-linux-${{ matrix.arch }}
-          path: herdr-bridge-linux-${{ matrix.arch }}
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
 
       - name: Publish Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          files: herdr-bridge-linux-${{ matrix.arch }}
+          files: ${{ matrix.asset }}
           generate_release_notes: true

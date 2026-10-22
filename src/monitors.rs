@@ -290,6 +290,7 @@ mod tests {
     /// show up in the walk and read as a monitor, and be gone once reaped.
     /// Scoped to our own child pid, so parallel tests' children can't flake it.
     #[test]
+    #[cfg(target_os = "linux")]
     fn live_proc_walk_finds_own_child() {
         let mut child = std::process::Command::new("sleep").arg("60").spawn().unwrap();
         let me = std::process::id();

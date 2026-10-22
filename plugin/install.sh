@@ -27,9 +27,10 @@ case "${1:-}" in
   mkdir -p "$BIN_DIR" "$LIB_DIR"
   # The release of the version this checkout is: "latest" can lag a new release, or run ahead of an old checkout.
   VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$SCRIPT_DIR/../Cargo.toml" | head -n1)"
-  # The release's binary, else a build from source (macOS has no release binary, and a download can fail).
-  if [[ "$OS" == Linux ]] && echo "Downloading herdr-bridge $VERSION for $ARCH..." &&
-    curl -fL --progress-bar -o "$BIN_DIR/herdr-bridge.new" "https://github.com/XicuM/herdr-bridge/releases/download/v$VERSION/herdr-bridge-linux-$ARCH"; then
+  # The release's binary, else a build from source (a download can fail).
+  [[ "$OS" == Darwin ]] && PLATFORM=macos || PLATFORM=linux
+  if echo "Downloading herdr-bridge $VERSION for $PLATFORM $ARCH..." &&
+    curl -fL --progress-bar -o "$BIN_DIR/herdr-bridge.new" "https://github.com/XicuM/herdr-bridge/releases/download/v$VERSION/herdr-bridge-$PLATFORM-$ARCH"; then
     chmod 755 "$BIN_DIR/herdr-bridge.new"
     mv "$BIN_DIR/herdr-bridge.new" "$BIN_DIR/herdr-bridge"
   elif command -v cargo >/dev/null; then
