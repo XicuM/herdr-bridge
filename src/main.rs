@@ -22,8 +22,9 @@ struct Args {
     #[arg(long, env = "HERDR_SOCKET", default_value_os_t = default_socket_path())]
     socket: PathBuf,
 
-    /// IP address to bind to. Defaults to 0.0.0.0 so the bridge answers on localhost and Tailscale alike.
-    #[arg(long, env = "HERDR_BRIDGE_BIND", default_value = "0.0.0.0")]
+    /// IP address to bind to. Defaults to this machine only: `tailscale serve` brings the tailnet to it, and
+    /// 0.0.0.0 opens it to every network the machine is on, where the token crosses in clear text.
+    #[arg(long, env = "HERDR_BRIDGE_BIND", default_value = "127.0.0.1")]
     bind: String,
 
     /// Port to listen on
