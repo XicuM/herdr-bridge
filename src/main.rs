@@ -126,7 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    info!("Starting Herdr Mobile Bridge v{}", env!("CARGO_PKG_VERSION"));
+    info!("Starting herdr-bridge v{}", env!("CARGO_PKG_VERSION"));
     info!("Targeting Herdr Unix Socket at {:?}", args.socket);
     info!("The app must send the token in {:?} (herdr-bridge --print-token shows it)", args.token_file);
 
@@ -146,7 +146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // An IPv6 bind needs no brackets this way.
     let addr = SocketAddr::new(args.bind.parse::<IpAddr>()?, args.port);
-    info!("Herdr Mobile Bridge listening on http://{}", addr);
+    info!("herdr-bridge listening on http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;

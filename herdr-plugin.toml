@@ -1,6 +1,6 @@
 id = "xicum.herdr-bridge"
 name = "Herdr Bridge"
-version = "0.1.1"
+version = "0.1.2"
 min_herdr_version = "0.9.5"
 description = "Reach your agents from herdr-mobile and herdr-obsidian: set up the bridge, pair a phone by QR code, check its status"
 platforms = ["linux", "macos"]
@@ -32,3 +32,11 @@ placement = "popup"
 width = "90%"
 height = "80%"
 command = ["bash", "plugin/install.sh", "--status"]
+
+[[panes]]
+id = "uninstall"
+title = "Uninstall bridge"
+placement = "popup"
+width = "80%"
+height = "60%"
+command = ["bash", "plugin/install.sh", "--uninstall"]

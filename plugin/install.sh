@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Sets up herdr-bridge on this machine (where herdr runs), herdr-mobile's Linux app, and pairing a phone.
-#   install.sh [--bridge] [--app] [--phone] [--lan] [--status]
-# With none of --bridge, --app, --phone or --status it asks which, or in a script sets up the bridge.
+#   install.sh [--bridge] [--app] [--phone] [--lan] [--status] [--uninstall]
+# With none of --bridge, --app, --phone, --status or --uninstall it asks which, or in a script sets up the bridge.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,7 +18,7 @@ mkdir -p "$BIN_DIR"
 # A herdr popup closes with its command, so leave what it printed up until it's read.
 [[ -n "${HERDR_PLUGIN_ID:-}" ]] && trap 'read -rp "Press Enter to close" _' EXIT
 
-BRIDGE= APP= PHONE= STATUS=
+BRIDGE= APP= PHONE= STATUS= UNINSTALL=
 # The bridge listens on this machine only, and `tailscale serve` brings the tailnet to it. --lan opens it to
 # every network the machine is on instead, where the token crosses in clear text.
 BIND=127.0.0.1
@@ -30,11 +30,12 @@ for arg in "$@"; do
     --phone) PHONE=1 ;;
     --lan) BIND=0.0.0.0 ;;
     --status) STATUS=1 ;;
-    *) echo "Usage: $0 [--bridge] [--app] [--phone] [--lan] [--status]" >&2; exit 2 ;;
+    --uninstall) UNINSTALL=1 ;;
+    *) echo "Usage: $0 [--bridge] [--app] [--phone] [--lan] [--status] [--uninstall]" >&2; exit 2 ;;
   esac
 done
 
-if [[ -z "$BRIDGE$APP$PHONE$STATUS" ]]; then
+if [[ -z "$BRIDGE$APP$PHONE$STATUS$UNINSTALL" ]]; then
   if [[ -t 0 ]]; then
     echo "What do you want to set up on this machine?"
     echo "  1) Bridge     this machine runs herdr and its agents"
@@ -62,6 +63,24 @@ if [[ -n "$STATUS" ]]; then
     journalctl --user -u herdr-bridge -n 30 --no-pager
   fi
   tailscale serve status 2>/dev/null || true
+fi
+
+# Undoes --bridge and --app; herdr runs nothing on `herdr plugin uninstall`. The token stays, so a phone paired
+# with this machine pairs again after a reinstall.
+if [[ -n "$UNINSTALL" ]]; then
+  if [[ "$OS" == Darwin ]]; then
+    launchctl bootout "gui/$(id -u)/dev.herdr.bridge" 2>/dev/null || true
+    rm -f "$HOME/Library/LaunchAgents/dev.herdr.bridge.plist"
+  elif [[ "$OS" == Linux ]]; then
+    systemctl --user disable --now herdr-bridge.service 2>/dev/null || true
+    rm -f "$HOME/.config/systemd/user/herdr-bridge.service" "$HOME/.config/systemd/user/herdr-bridge.service.d/lan.conf"
+    systemctl --user daemon-reload
+  fi
+  tailscale serve --tcp "$PORT" off >/dev/null 2>&1 || true
+  rm -f "$BIN_DIR/herdr-bridge" "$BIN_DIR/start-bridge.sh"
+  rm -rf "$HOME/.local/lib/herdr-mobile" "$BIN_DIR/herdr-mobile" "$HOME/.local/share/applications/herdr-mobile.desktop"
+  echo "Removed herdr-bridge and its service, and herdr-mobile's Linux app if it was installed."
+  echo "The token stays in ~/.config/herdr-bridge; remove that folder to forget it."
 fi
 
 if [[ -n "$BRIDGE" ]]; then
