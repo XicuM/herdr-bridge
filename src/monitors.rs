@@ -163,6 +163,9 @@ fn is_wrapper(cmdline: &str, agent: &str) -> bool {
     if !agent.is_empty() && base == agent.to_lowercase() {
         return true;
     }
+    if agent.eq_ignore_ascii_case("codex") && base == "codex-code-mode" {
+        return true;
+    }
     if cmdline.to_lowercase().contains("mcp") {
         return true;
     }
@@ -259,6 +262,19 @@ mod tests {
         assert!(is_wrapper("/usr/bin/claude --resume abc", "claude"));
         assert!(is_wrapper("agy", "agy"));
         assert!(!is_wrapper("/usr/bin/bash -c scons", "claude"));
+    }
+
+    #[test]
+    fn codex_helpers_are_not_monitors_but_their_jobs_are() {
+        let mut procs = HashMap::from([
+            (200, proc_(100, 'S', "codex")),
+            (300, proc_(200, 'S', "codex app-server daemon pid-update-loop")),
+            (400, proc_(300, 'S', "codex app-server --listen unix://")),
+            (500, proc_(400, 'S', "/opt/codex/codex-code-mode")),
+        ]);
+        assert!(!has_monitors(&procs, 100, "codex"));
+        procs.insert(600, proc_(500, 'S', "sleep 600"));
+        assert!(has_monitors(&procs, 100, "codex"));
     }
 
     #[test]
