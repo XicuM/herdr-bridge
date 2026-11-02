@@ -1,3 +1,4 @@
+mod appearance;
 mod deliveries;
 mod herdr;
 mod monitors;
@@ -163,12 +164,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start background event listener
     herdr.clone().start_event_listener();
 
+    let machine_changes = tokio::sync::broadcast::channel(16).0;
+    server::watch_endpoints(machine_changes.clone());
+
     let state = AppState {
         herdr: herdr.clone(),
         snapshots: server::start_snapshot_poller(herdr.clone()),
         opens: tokio::sync::broadcast::channel(16).0,
         deliveries: tokio::sync::broadcast::channel(16).0,
         vault: vault::Watcher::new(),
+        machine_changes,
     };
 
     let app = create_router(state, token);

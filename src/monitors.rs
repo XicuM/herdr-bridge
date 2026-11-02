@@ -160,7 +160,10 @@ fn has_monitors(procs: &HashMap<u32, Proc>, shell: u32, agent: &str) -> bool {
 fn is_wrapper(cmdline: &str, agent: &str) -> bool {
     let argv0 = cmdline.split(' ').next().unwrap_or_default();
     let base = argv0.rsplit('/').next().unwrap_or_default().to_lowercase();
-    if !agent.is_empty() && base == agent.to_lowercase() {
+    // The agent binary can carry a suffix herdr's agent name doesn't have:
+    // opencode ships as `opencode.exe` under mise.
+    let stem = base.strip_suffix(".exe").unwrap_or(&base);
+    if !agent.is_empty() && stem == agent.to_lowercase() {
         return true;
     }
     if agent.eq_ignore_ascii_case("codex") && base == "codex-code-mode" {
@@ -261,6 +264,7 @@ mod tests {
     fn agent_name_matches_by_basename() {
         assert!(is_wrapper("/usr/bin/claude --resume abc", "claude"));
         assert!(is_wrapper("agy", "agy"));
+        assert!(is_wrapper("/home/xicu/.local/share/mise/installs/opencode/latest/node_modules/.bin/../.mise/@opencode+cli@2.2.2/node_modules/@opencode/cli/bin/opencode.exe", "opencode"));
         assert!(!is_wrapper("/usr/bin/bash -c scons", "claude"));
     }
 

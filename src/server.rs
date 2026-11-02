@@ -16,9 +16,11 @@ use serde_json::{json, Value};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
+use notify::Watcher as _;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
@@ -40,6 +42,8 @@ pub struct AppState {
     pub deliveries: broadcast::Sender<Utf8Bytes>,
     /// This machine's Obsidian vaults, whose changes go to every `/ws/session`: one for all machines.
     pub vault: Arc<crate::vault::Watcher>,
+    /// Machine list changes (`POST /api/machines`, `herdr machine add`), sent as `/ws/session` messages.
+    pub machine_changes: broadcast::Sender<Utf8Bytes>,
 }
 
 /// Every machine the bridge serves: its own, at `/`, and each one saved in herdr (`herdr machine list`)
@@ -73,6 +77,9 @@ pub fn create_router(local: AppState, token: String) -> Router {
 fn routes() -> Router {
     Router::new()
         .route("/health", get(health_check))
+        // The appearance is a property of the machine the bridge runs on, not of a herdr machine:
+        // it never takes a `/m/` or `/s/` prefix, so a request through one still themes this machine.
+        .route("/api/appearance", post(post_appearance).get(get_appearance))
         // Answers once past [require_token]: how the app tells a wrong token from a bridge that's down.
         .route("/api/auth", get(|| async { Json(json!({})) }))
         .route("/api/machines", get(get_machines).post(post_machine))
@@ -114,6 +121,9 @@ async fn pick_machine(State(machines): State<Machines>, mut req: Request, next: 
     if let Some(rest) = req.uri().path().strip_prefix("/m/") {
         let (id, rest) = rest.split_once('/').unwrap_or((rest, ""));
         let (id, path) = (id.to_string(), format!("/{rest}{}", req.uri().query().map_or(String::new(), |q| format!("?{q}"))));
+        if path.starts_with("/api/machines") {
+            return (StatusCode::NOT_FOUND, "Remote machine has no machine management").into_response();
+        }
         let mut remote = machines.remote.lock().await;
         if !remote.contains_key(&id) {
             let Some(saved) = saved_machines().await.into_iter().find(|m| m["id"] == id.as_str()) else {
@@ -131,6 +141,7 @@ async fn pick_machine(State(machines): State<Machines>, mut req: Request, next: 
                 opens: broadcast::channel(16).0,
                 deliveries: broadcast::channel(16).0,
                 vault,
+                machine_changes: broadcast::channel(16).0,
             });
         }
         machine = remote[&id].clone();
@@ -139,11 +150,21 @@ async fn pick_machine(State(machines): State<Machines>, mut req: Request, next: 
     } else if let Some(rest) = req.uri().path().strip_prefix("/s/") {
         let (session, rest) = rest.split_once('/').unwrap_or((rest, ""));
         let (session, path) = (session.to_string(), format!("/{rest}{}", req.uri().query().map_or(String::new(), |q| format!("?{q}"))));
+        if path.starts_with("/api/machines") {
+            return (StatusCode::NOT_FOUND, "Session has no machine management").into_response();
+        }
         let mut sessions = machines.sessions.lock().await;
         if !sessions.contains_key(&session) {
             let herdr = Arc::new(HerdrClient::session(session.clone()));
             herdr.clone().start_event_listener();
-            sessions.insert(session.clone(), AppState { snapshots: start_snapshot_poller(herdr.clone()), herdr, opens: broadcast::channel(16).0, deliveries, vault });
+            sessions.insert(session.clone(), AppState {
+                snapshots: start_snapshot_poller(herdr.clone()),
+                herdr,
+                opens: broadcast::channel(16).0,
+                deliveries,
+                vault,
+                machine_changes: broadcast::channel(16).0,
+            });
         }
         machine = sessions[&session].clone();
         drop(sessions);
@@ -176,7 +197,7 @@ struct NewMachine {
 
 /// Saves an SSH machine in this herdr (`herdr machine add`, which also gets herdr ready there), so it
 /// is reached as the others are. With no terminal, SSH can't ask for a password: the key must work.
-async fn post_machine(Json(new): Json<NewMachine>) -> ApiResult {
+async fn post_machine(Extension(state): Extension<AppState>, Json(new): Json<NewMachine>) -> ApiResult {
     // herdr's parser has no `--`: a target starting with `-` would be an option.
     if new.target.is_empty() || new.target.starts_with('-') || new.label.as_deref().is_some_and(|l| l.starts_with('-')) {
         return Err((StatusCode::BAD_REQUEST, "Invalid SSH target or name".into()));
@@ -185,13 +206,17 @@ async fn post_machine(Json(new): Json<NewMachine>) -> ApiResult {
     if let Some(label) = new.label.filter(|l| !l.is_empty()) {
         args.extend(["--label".into(), label]);
     }
-    herdr_cli(&args).await.map(|_| Json(json!({})))
+    let res = herdr_cli(&args).await.map(|_| Json(json!({})));
+    if res.is_ok() {
+        let _ = state.machine_changes.send(json!({ "type": "machines" }).to_string().into());
+    }
+    res
 }
 
 /// Renames a saved machine (`herdr machine rename`) and, given another target, moves it there. herdr
 /// can't change a machine's target, so it is added anew (keeping its session) and the old one removed
 /// once that worked, so a wrong target loses nothing; it then has a new id.
-async fn post_machine_edit(Path(id): Path<String>, Json(edit): Json<NewMachine>) -> ApiResult {
+async fn post_machine_edit(Extension(state): Extension<AppState>, Path(id): Path<String>, Json(edit): Json<NewMachine>) -> ApiResult {
     let Some(saved) = saved_machines().await.into_iter().find(|m| m["id"] == id.as_str()) else {
         return Err((StatusCode::NOT_FOUND, format!("herdr has no machine {id}")));
     };
@@ -215,14 +240,19 @@ async fn post_machine_edit(Path(id): Path<String>, Json(edit): Json<NewMachine>)
         id = new_id;
     }
     herdr_cli(&["machine".into(), "rename".into(), id.clone(), "--label".into(), label]).await?;
+    let _ = state.machine_changes.send(json!({ "type": "machines" }).to_string().into());
     Ok(Json(json!({ "id": id })))
 }
 
-async fn delete_machine(Path(id): Path<String>) -> ApiResult {
+async fn delete_machine(Extension(state): Extension<AppState>, Path(id): Path<String>) -> ApiResult {
     if id.starts_with('-') {
         return Err((StatusCode::BAD_REQUEST, "Invalid machine".into()));
     }
-    herdr_cli(&["machine".into(), "remove".into(), id]).await.map(|_| Json(json!({})))
+    let res = herdr_cli(&["machine".into(), "remove".into(), id]).await.map(|_| Json(json!({})));
+    if res.is_ok() {
+        let _ = state.machine_changes.send(json!({ "type": "machines" }).to_string().into());
+    }
+    res
 }
 
 /// One `herdr` command on this machine; when it fails, its last line of output comes back as a 400.
@@ -300,6 +330,23 @@ async fn health_check() -> Json<Value> {
         "service": "herdr-bridge",
         "version": env!("CARGO_PKG_VERSION")
     }))
+}
+
+#[derive(Deserialize)]
+struct AppearanceBody {
+    mode: String,
+}
+
+/// The user's light/dark appearance, as herdr-obsidian sees it: applied to this machine's OpenCode
+/// configs, which reload it while they run ([crate::appearance]).
+async fn post_appearance(Json(body): Json<AppearanceBody>) -> ApiResult {
+    let mode = crate::appearance::mode(&body.mode).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    crate::appearance::apply(mode);
+    Ok(Json(json!({ "status": "ok", "mode": mode })))
+}
+
+async fn get_appearance() -> Json<Value> {
+    Json(json!({ "mode": crate::appearance::current() }))
 }
 
 async fn get_snapshot(Extension(state): Extension<AppState>) -> Result<Json<Value>, (StatusCode, String)> {
@@ -600,6 +647,7 @@ async fn handle_ws_session(socket: WebSocket, state: AppState, deliveries: bool)
     let mut opens = state.opens.subscribe();
     let mut deliveries = deliveries.then(|| state.deliveries.subscribe());
     let mut vault_changes = state.vault.changes.subscribe();
+    let mut machine_changes = state.machine_changes.subscribe();
     let herdr = state.herdr.clone();
     let vault = state.vault.clone();
     tokio::task::spawn_blocking(move || vault.watch_vaults());
@@ -640,6 +688,11 @@ async fn handle_ws_session(socket: WebSocket, state: AppState, deliveries: bool)
                 },
                 // A phone that fell behind misses some: its next full sync (on resume) catches up.
                 change = vault_changes.recv() => match change {
+                    Ok(text) => text,
+                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => break,
+                },
+                machine_msg = machine_changes.recv() => match machine_msg {
                     Ok(text) => text,
                     Err(RecvError::Lagged(_)) => continue,
                     Err(RecvError::Closed) => break,
@@ -838,4 +891,68 @@ async fn handle_ws_term(mut socket: WebSocket, herdr: &HerdrClient, pane_id: Str
         let _ = child.kill().await;
     }
     Ok(())
+}
+
+/// Watches the herdr endpoints state file (`~/.local/state/herdr/client/endpoints.json`) for external machine changes.
+pub fn watch_endpoints(tx: broadcast::Sender<Utf8Bytes>) {
+    let endpoints_file = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
+        .unwrap_or_else(|| PathBuf::from(".local/state"))
+        .join("herdr/client/endpoints.json");
+
+    let Some(state_dir) = endpoints_file.parent() else { return };
+    if !state_dir.exists() {
+        return;
+    }
+
+    let (events_tx, events_rx) = std::sync::mpsc::channel();
+    let Ok(mut watcher) = notify::recommended_watcher(events_tx) else {
+        warn!("Could not start watcher for endpoints in {:?}", state_dir);
+        return;
+    };
+    if watcher.watch(state_dir, notify::RecursiveMode::NonRecursive).is_err() {
+        return;
+    }
+
+    std::thread::spawn(move || {
+        let _watcher = watcher;
+        let mut last_event = std::time::Instant::now();
+        let mut last_mtime = std::fs::metadata(&endpoints_file).and_then(|m| m.modified()).ok();
+        let mut pending = false;
+        loop {
+            let timeout = if pending {
+                std::time::Duration::from_millis(150)
+            } else {
+                std::time::Duration::from_secs(3600)
+            };
+            match events_rx.recv_timeout(timeout) {
+                Ok(Ok(event)) => {
+                    let is_change = matches!(
+                        event.kind,
+                        notify::EventKind::Modify(_) | notify::EventKind::Create(_) | notify::EventKind::Remove(_)
+                    );
+                    let affects_endpoints = is_change && event.paths.iter().any(|p| {
+                        p.file_name().is_some_and(|n| n == "endpoints.json")
+                    });
+                    if affects_endpoints {
+                        let current_mtime = std::fs::metadata(&endpoints_file).and_then(|m| m.modified()).ok();
+                        if current_mtime != last_mtime {
+                            last_mtime = current_mtime;
+                            pending = true;
+                            last_event = std::time::Instant::now();
+                        }
+                    }
+                }
+                Ok(Err(_)) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if pending && last_event.elapsed() >= std::time::Duration::from_millis(100) {
+                        pending = false;
+                        let _ = tx.send(json!({ "type": "machines" }).to_string().into());
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    });
 }

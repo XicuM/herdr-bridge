@@ -28,12 +28,14 @@ What clients (herdr-mobile, herdr-obsidian) can rely on. Every request but `/hea
 | `POST /api/deliveries` | `{file, title?, pane_id?}` (`file` absolute, at most 200 MB): sends a copy to herdr-mobile, as a `delivery` message. 409 when no app is connected from another device. |
 | `GET /api/deliveries/{id}` | A delivered file, by its message's `id`; the last 10 are kept, 404 after that. |
 | `POST /api/obsidian/open` | `{file, heading?, line?}` (`file` absolute, inside a vault): the Herdr plugin of that vault shows it. 409 when no plugin is connected, 404 outside any vault. |
+| `POST /api/appearance` | `{mode: "light" \| "dark"}`: the user's light/dark appearance, as the app sees it. The bridge records it and sets `theme.mode` in this machine's OpenCode configs (`~/.config/opencode/cli.json`, and each PodarcisNest user's `opencode-cli.json` when `HERDR_BRIDGE_NEST_DATA` is set), which OpenCode reloads while it runs. `GET` answers `{"mode": …}` (null before the first). 400 for any other mode. |
 
 ## WebSockets
 
 - `/ws/session`: JSON messages.
   - `{"type":"snapshot","data":…}` on each change.
   - `{"type":"error","error":"…"}` when there is no snapshot.
+  - `{"type":"machines"}` when saved machines change (`herdr machine add/remove/rename`).
   - `{"type":"open","vault":"Notes","path":"a/b.md","heading":"Intro","line":7}` when an agent asks to show a note. Clients of other vaults ignore it.
   - `{"type":"vault_changed","vault":"Notes","files":[{"path":"a/b.md","mtime":…,"mtime_ms":…,"size":…},{"path":"c.md","deleted":true}]}` when synced files of a vault on the bridge's machine change, half a second after a burst of writes ends. Each file is as the manifest would list it now, or deleted. A client that missed some (disconnected, or fell behind) catches up with a full sync. Clients of other vaults ignore it.
   - `{"type":"delivery","id":"045efe2bbdc0c1c1","name":"app-release.apk","size":61022208,"mime":"application/vnd.android.package-archive","title":"Debug build","pane_id":"w1:p2"}` when an agent sends the user a file (`herdr-bridge send`); fetch it from `GET /api/deliveries/{id}`. `title` and `pane_id` (the sending agent's pane on this machine) may be null. Only sent to connections without an `Origin` whose `Host` isn't a loopback address: the app on the bridge's own machine already has the file.
