@@ -9,6 +9,9 @@
 //! servers an editor integration keeps running for diagnostics/completion)
 //! counts.
 //!
+//! opencode is the exception: its tool calls run in one shared `serve` process, so its panes' subtrees
+//! say nothing about their own session; its `job` table (running background shells, by session id) does.
+//!
 //! Local machine only (like `usage`): over SSH the walk would have to run
 //! there. Results are cached 10 s; pane→shell pids 60 s (ids are reused).
 
@@ -38,15 +41,16 @@ struct Proc {
 /// the agents are left unmarked.
 pub async fn mark(client: &HerdrClient, snap: &mut serde_json::Value) {
     let Some(agents) = snap["agents"].as_array() else { return };
-    let panes: Vec<(String, String)> = agents
+    let panes: Vec<(String, String, Option<String>)> = agents
         .iter()
         .map(|a| {
             (
                 a["pane_id"].as_str().unwrap_or_default().to_string(),
                 a["agent"].as_str().or(a["name"].as_str()).unwrap_or_default().to_string(),
+                a.pointer("/agent_session/value").and_then(|v| v.as_str()).map(String::from),
             )
         })
-        .filter(|(pane, _)| !pane.is_empty())
+        .filter(|(pane, _, _)| !pane.is_empty())
         .collect();
     if panes.is_empty() {
         return;
@@ -54,7 +58,7 @@ pub async fn mark(client: &HerdrClient, snap: &mut serde_json::Value) {
     let now = Instant::now();
     let mut fresh: HashMap<String, bool> = HashMap::new();
     if let Ok(results) = RESULTS.lock() {
-        for (pane, _) in &panes {
+        for (pane, _, _) in &panes {
             if let Some((at, monitoring)) = results.get(pane)
                 && now.duration_since(*at) < RESULTS_TTL
             {
@@ -70,8 +74,15 @@ pub async fn mark(client: &HerdrClient, snap: &mut serde_json::Value) {
         return;
     }
     let mut computed = fresh;
-    for (pane, agent) in &panes {
+    let opencode_jobs = opencode_running_jobs().await;
+    for (pane, agent, session) in &panes {
         if computed.contains_key(pane) {
+            continue;
+        }
+        // opencode runs every session's tool calls under one shared `serve` process, so the pane's `/proc`
+        // subtree holds another session's jobs (or none of its own): its own database says whose they are.
+        if let (Some(jobs), Some(session), true) = (&opencode_jobs, session, agent.eq_ignore_ascii_case("opencode")) {
+            computed.insert(pane.clone(), jobs.contains(session));
             continue;
         }
         let monitoring = shell_pid(client, pane).await.is_some_and(|shell| has_monitors(&procs, shell, agent));
@@ -94,6 +105,20 @@ fn apply(snap: &mut serde_json::Value, monitoring: &HashMap<String, bool>) {
             agent["monitoring"] = (*monitoring).into();
         }
     }
+}
+
+/// Session ids of opencode's running background shell jobs (its `job` table), or `None` when the
+/// database can't be read (no `sqlite3`, no opencode, a schema that moved): the caller falls back to `/proc`.
+async fn opencode_running_jobs() -> Option<HashSet<String>> {
+    let data = std::env::var("XDG_DATA_HOME").ok().filter(|d| !d.is_empty()).or_else(|| std::env::var("HOME").ok().map(|h| format!("{h}/.local/share")))?;
+    let db = format!("{data}/opencode/opencode.db");
+    if !std::path::Path::new(&db).exists() {
+        return None;
+    }
+    let mut cmd = tokio::process::Command::new("sqlite3");
+    cmd.args(["-readonly", &db, "select distinct session_id from job where kind='shell' and status='running'"]).kill_on_drop(true);
+    let out = tokio::time::timeout(Duration::from_secs(5), cmd.output()).await.ok()?.ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).lines().map(String::from).collect())
 }
 
 /// The pane's shell pid, cached: it never changes while the pane lives, but
@@ -166,7 +191,7 @@ fn is_wrapper(cmdline: &str, agent: &str) -> bool {
     if !agent.is_empty() && stem == agent.to_lowercase() {
         return true;
     }
-    if agent.eq_ignore_ascii_case("codex") && base == "codex-code-mode" {
+    if agent.eq_ignore_ascii_case("codex") && matches!(base.as_str(), "codex-code-mode" | "codex-code-mode-host") {
         return true;
     }
     if cmdline.to_lowercase().contains("mcp") {
@@ -274,7 +299,7 @@ mod tests {
             (200, proc_(100, 'S', "codex")),
             (300, proc_(200, 'S', "codex app-server daemon pid-update-loop")),
             (400, proc_(300, 'S', "codex app-server --listen unix://")),
-            (500, proc_(400, 'S', "/opt/codex/codex-code-mode")),
+            (500, proc_(400, 'S', "/opt/codex/codex-code-mode-host")),
         ]);
         assert!(!has_monitors(&procs, 100, "codex"));
         procs.insert(600, proc_(500, 'S', "sleep 600"));
