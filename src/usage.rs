@@ -32,6 +32,11 @@ const AGY_LIVE_TTL: Duration = Duration::from_secs(300);
 static CLAUDE_LIVE: LazyLock<Mutex<(Option<Instant>, Option<(Option<String>, Vec<Value>)>)>> = LazyLock::new(Default::default);
 const CLAUDE_LIVE_TTL: Duration = Duration::from_secs(60);
 
+/// Amp's usage comes from `amp usage`, one of the 60 account usage lookups Amp allows an hour, which the
+/// user's own `amp usage` and their agents share: when it was last run, and its answer.
+static AMP_LIVE: LazyLock<Mutex<(Option<Instant>, Option<Value>)>> = LazyLock::new(Default::default);
+const AMP_LIVE_TTL: Duration = Duration::from_secs(300);
+
 /// Transcripts last written before this long ago hold nothing from today.
 const RECENT: Duration = Duration::from_secs(26 * 3600);
 
@@ -113,6 +118,8 @@ fn read(name: &str) -> Option<Value> {
         openrouter(home)
     } else if name.contains("deepseek") {
         deepseek(home)
+    } else if name == "amp" || name.starts_with("amp-") {
+        amp(home)
     } else {
         None
     }
@@ -953,6 +960,57 @@ fn deepseek(home: &Path) -> Option<Value> {
     Some(json!({ "tier_label": tier.unwrap_or_else(|| "DeepSeek".to_string()), "limits": limits, "today_tokens": 0, "today_prompts": 0 }))
 }
 
+/// Amp: its credit balances and today's tokens (UTC, as the other agents' days are), from `amp usage`.
+/// Amp keeps no dated record of prompts on disk, so there are none: unknown, not zero.
+fn amp(home: &Path) -> Option<Value> {
+    let mut live = AMP_LIVE.lock().ok()?;
+    if live.0.is_none_or(|at| at.elapsed() >= AMP_LIVE_TTL) {
+        live.0 = Some(Instant::now());
+        let day = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()) / 86400 * 86400;
+        live.1 = std::process::Command::new("amp")
+            .args(["usage", "--start", &iso(day), "--end", &iso(day + 86400)])
+            .env("HOME", home)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| amp_parse(&String::from_utf8_lossy(&o.stdout)));
+    }
+    live.1.clone()
+}
+
+/// `amp usage`'s Markdown: a `**<pool>:** $<left> remaining` line per balance (`$<left>/$<total>` for one
+/// that refills, as Amp Free does, which makes it a limit), then the range's `Total tokens:` and
+/// `Total recorded cost:`. A balance with no total has no percentage, so it goes in the tier label.
+fn amp_parse(text: &str) -> Option<Value> {
+    let dollars = |s: &str| s.trim().strip_prefix('$')?.replace(',', "").parse::<f64>().ok();
+    let (mut limits, mut balances, mut tokens, mut cost) = (Vec::new(), Vec::new(), None, None);
+    for line in text.lines() {
+        if let Some((pool, value)) = line.strip_prefix("**").and_then(|l| l.split_once(":**"))
+            && let Some((amount, _)) = value.split_once(" remaining")
+        {
+            let amount = amount.trim();
+            if let Some((left, total)) = amount.split_once('/')
+                && let (Some(left), Some(total)) = (dollars(left), dollars(total))
+                && total > 0.0
+            {
+                limits.push(json!({ "label": pool, "percent": (1.0 - left / total).clamp(0.0, 1.0) }));
+            } else {
+                balances.push(format!("{pool}: {amount} left"));
+            }
+        } else if let Some(n) = line.strip_prefix("Total tokens:") {
+            tokens = n.trim().replace(',', "").parse::<u64>().ok();
+        } else if let Some(c) = line.strip_prefix("Total recorded cost:") {
+            cost = Some(c.trim().to_string());
+        }
+    }
+    if limits.is_empty() && balances.is_empty() && tokens.is_none() {
+        return None;
+    }
+    let tier = balances.into_iter().chain(cost.map(|c| format!("{c} today"))).collect::<Vec<_>>().join(" · ");
+    let tier = if tier.is_empty() { "Amp".to_string() } else { tier };
+    Some(json!({ "tier_label": tier, "limits": limits, "today_tokens": tokens.unwrap_or(0) }))
+}
+
 fn cache_json(home: &Path, names: &[&str]) -> Option<Value> {
     let state_dirs = [
         home.join(".cache/ai-usagebar"),
@@ -1270,6 +1328,26 @@ mod tests {
         let got = deepseek(&home).unwrap();
         assert_eq!(got["tier_label"], "DeepSeek API");
         assert_eq!(got["limits"][0]["title"], "50.00 USD");
+    }
+
+    #[test]
+    fn amp_parses_usage() {
+        let got = amp_parse(
+            "# Usage\n\nSigned in as a@b.c\n**Individual credits:** $1,208.62 remaining (set up auto-reload) - https://ampcode.com/settings\n\n\
+             Range: 2026-11-03T00:00:00.000Z to 2026-11-04T00:00:00.000Z (end exclusive)\nTotal tokens: 2,192,014\nTotal recorded cost: $1.38\n",
+        )
+        .unwrap();
+        assert_eq!(got["tier_label"], "Individual credits: $1,208.62 left · $1.38 today");
+        assert_eq!(got["limits"], json!([]));
+        assert_eq!(got["today_tokens"], 2_192_014);
+        assert!(got.get("today_prompts").is_none());
+
+        // A balance that refills has a total, so it is a limit: $7.50 of $10 left is a quarter used.
+        let got = amp_parse("**Amp Free:** $7.50/$10 remaining (replenishes +$0.42/hour)\nTotal tokens: 0\n").unwrap();
+        assert_eq!(got["tier_label"], "Amp");
+        assert_eq!(got["limits"], json!([{ "label": "Amp Free", "percent": 0.25 }]));
+
+        assert!(amp_parse("Error: not signed in\n").is_none());
     }
 
     #[test]
