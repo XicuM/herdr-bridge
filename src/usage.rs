@@ -1192,6 +1192,8 @@ mod tests {
                 {"label": "GPT Models Weekly", "percent": 1.0},
             ]
         }).to_string()).unwrap();
+        // A fresh empty probe, so a signed-in `agy` on this machine (which ignores HOME) can't answer first.
+        *AGY_LIVE.lock().unwrap() = (Some(Instant::now()), Vec::new());
         let got = antigravity(&home).unwrap();
         let limits = got["limits"].as_array().unwrap();
         assert_eq!(limits.len(), 4);
