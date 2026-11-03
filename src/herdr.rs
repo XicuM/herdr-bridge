@@ -49,6 +49,72 @@ fn control_dir() -> PathBuf {
     DIR.clone()
 }
 
+fn current_uid() -> u32 {
+    unsafe extern "C" {
+        fn getuid() -> u32;
+    }
+    unsafe { getuid() }
+}
+
+/// The OpenSSH `%C` token (a 40-character SHA1 hash of local hostname, remote host, port, remote user)
+/// for this target, as resolved by ssh config. Cached so `ssh -G` runs at most once per target.
+fn target_control_hash(target: &str) -> Option<String> {
+    static HASHES: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Default::default);
+    if let Ok(map) = HASHES.lock() {
+        if let Some(hash) = map.get(target) {
+            return Some(hash.clone());
+        }
+    }
+    let out = std::process::Command::new("ssh")
+        .args(["-o", "ControlPath=%C", "-G", target])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("controlpath ") {
+            let hash = rest.trim().to_string();
+            if !hash.is_empty() {
+                if let Ok(mut map) = HASHES.lock() {
+                    map.insert(target.to_string(), hash.clone());
+                }
+                return Some(hash);
+            }
+        }
+    }
+    None
+}
+
+/// Looks for an active Herdr SSH multiplexer master socket for [target]. Herdr creates master sockets
+/// in `/tmp/hssh-<uid>/<prefix>-%C`. If Herdr is running and connected to [target], joining its socket
+/// reuses that authenticated connection without prompting for a password or requiring pre-installed keys.
+fn find_herdr_mux_socket(target: &str) -> Option<PathBuf> {
+    let hash = target_control_hash(target)?;
+    let uid = current_uid();
+    let dirs = [
+        PathBuf::from(format!("/tmp/hssh-{uid}")),
+        control_dir().join(format!("hssh-{uid}")),
+    ];
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.ends_with(&hash) {
+                let path = entry.path();
+                // Check if the master socket is listening.
+                if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+                    debug!("Reusing active Herdr master socket {:?} for {target}", path);
+                    return Some(path);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// One connection to herdr's API: its reader, its writer, and the `ssh` carrying it, if any.
 type Conn = (Box<dyn AsyncRead + Unpin + Send>, Box<dyn AsyncWrite + Unpin + Send>, Option<Child>);
 
@@ -84,7 +150,17 @@ impl HerdrClient {
     /// server is stopped or incompatible; run …"), or [error] when herdr can. This machine's own failure
     /// is the bridge's [error], since herdr has nothing to add.
     pub async fn machine_error(&self, error: String) -> String {
-        let Some(id) = &self.machine else { return error };
+        let Some(id) = &self.machine else {
+            if error.contains("Permission denied") {
+                let target = self.ssh.as_deref().unwrap_or("remote machine");
+                return format!(
+                    "SSH authentication failed for {target}.\n\n\
+                    • Open Herdr on your computer to connect interactively.\n\
+                    • For 24/7 mobile access without opening Herdr, run:\n  ssh-copy-id {target}"
+                );
+            }
+            return error;
+        };
         let Ok(out) = Command::new("herdr").args(["machine", "status", id, "--json"]).output().await else {
             return error;
         };
@@ -95,8 +171,32 @@ impl HerdrClient {
             (Some("auth required"), Some(e)) => {
                 format!("{e}\nRun `herdr machine reconnect {}` on the bridge's machine.", row["label"].as_str().unwrap_or(id))
             }
-            (_, Some(e)) => e.to_string(),
-            _ => error,
+            (_, Some(e)) => {
+                if e.contains("Permission denied") {
+                    let label = row["label"].as_str().unwrap_or(id);
+                    let target = self.ssh.as_deref().unwrap_or(label);
+                    format!(
+                        "SSH authentication failed for {label} ({target}).\n\n\
+                        • Open Herdr on your computer to connect interactively.\n\
+                        • For 24/7 mobile access without opening Herdr, run:\n  ssh-copy-id {target}"
+                    )
+                } else {
+                    e.to_string()
+                }
+            }
+            _ => {
+                if error.contains("Permission denied") {
+                    let label = row["label"].as_str().unwrap_or(id);
+                    let target = self.ssh.as_deref().unwrap_or(label);
+                    format!(
+                        "SSH authentication failed for {label} ({target}).\n\n\
+                        • Open Herdr on your computer to connect interactively.\n\
+                        • For 24/7 mobile access without opening Herdr, run:\n  ssh-copy-id {target}"
+                    )
+                } else {
+                    error
+                }
+            }
         }
     }
 
@@ -116,16 +216,20 @@ impl HerdrClient {
             cmd.args(args);
             return cmd;
         };
-        let dir = control_dir();
         // The remote shell parses the command line: every argument is quoted. A non-interactive login
         // may lack `~/.local/bin`, where herdr installs itself.
         let quoted: Vec<String> = [program].iter().chain(args).map(|a| format!("'{}'", a.replace('\'', r"'\''"))).collect();
         let mut cmd = Command::new("ssh");
-        cmd.args(["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=15"])
-            .args(["-o", "ControlMaster=auto", "-o", "ControlPersist=600"])
-            .arg("-o")
-            .arg(format!("ControlPath={}/herdr-bridge-%C", dir.display()))
-            .arg(target)
+        cmd.args(["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=15"]);
+        if let Some(sock) = find_herdr_mux_socket(target) {
+            cmd.arg("-S").arg(sock);
+        } else {
+            let dir = control_dir();
+            cmd.args(["-o", "ControlMaster=auto", "-o", "ControlPersist=600"])
+                .arg("-o")
+                .arg(format!("ControlPath={}/herdr-bridge-%C", dir.display()));
+        }
+        cmd.arg(target)
             .arg(format!("PATH=\"$HOME/.local/bin:$PATH\" exec {}", quoted.join(" ")));
         cmd
     }
@@ -524,5 +628,22 @@ impl HerdrClient {
                 wait = (wait * 2).min(60);
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_hash_is_40_hex_chars() {
+        let hash = target_control_hash("testuser@example.com").expect("resolves control hash");
+        assert_eq!(hash.len(), 40);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn nonexistent_target_has_no_mux_socket() {
+        assert_eq!(find_herdr_mux_socket("nonexistent-user@invalid-host-herdr-test"), None);
     }
 }
