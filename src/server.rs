@@ -229,17 +229,40 @@ async fn post_machine_edit(Extension(state): Extension<AppState>, Path(id): Path
         if edit.target.is_empty() || edit.target.starts_with('-') {
             return Err((StatusCode::BAD_REQUEST, "Invalid SSH target".into()));
         }
-        let before: Vec<Value> = saved_machines().await.into_iter().map(|m| m["id"].clone()).collect();
+        // Include disabled machines: herdr still reserves their labels.
+        let out = Command::new("herdr").args(["machine", "list", "--json"]).output().await
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("Failed to list machines: {e}")))?;
+        if !out.status.success() {
+            return Err((StatusCode::BAD_REQUEST, "Failed to list machines".into()));
+        }
+        let machines: Vec<Value> = serde_json::from_slice(&out.stdout)
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("Failed to read machines: {e}")))?;
+        if machines.iter().any(|m| m["id"] != id.as_str() && m["label"] == label.as_str()) {
+            return Err((StatusCode::BAD_REQUEST, format!("A machine named '{label}' already exists")));
+        }
+        let mut temporary = format!("herdr-bridge-{id}");
+        while machines.iter().any(|m| m["label"] == temporary.as_str()) {
+            temporary.push('x');
+        }
         let session = saved["session"].as_str().unwrap_or("default").to_string();
-        herdr_cli(&["machine".into(), "add".into(), edit.target, "--remote-session".into(), session]).await?;
-        let added = saved_machines().await.into_iter().find(|m| !before.contains(&m["id"]));
+        herdr_cli(&["machine".into(), "add".into(), edit.target, "--remote-session".into(), session, "--label".into(), temporary.clone()]).await?;
+        let added = saved_machines().await.into_iter().find(|m| m["label"] == temporary.as_str());
         let Some(new_id) = added.and_then(|m| m["id"].as_str().map(String::from)) else {
-            return Err((StatusCode::BAD_REQUEST, "herdr saved no new machine".into()));
+            return Err((StatusCode::BAD_REQUEST, format!("Could not find the new machine '{temporary}'; the original was kept")));
         };
-        herdr_cli(&["machine".into(), "remove".into(), id]).await?;
+        if let Err((status, error)) = herdr_cli(&["machine".into(), "remove".into(), id]).await {
+            let cleanup = herdr_cli(&["machine".into(), "remove".into(), new_id]).await;
+            let detail = if cleanup.is_err() { format!("; the new machine remains as '{temporary}'") } else { String::new() };
+            return Err((status, format!("{error}; the original was kept{detail}")));
+        }
         id = new_id;
+        if let Err((status, error)) = herdr_cli(&["machine".into(), "rename".into(), id.clone(), "--label".into(), label.clone()]).await {
+            let _ = state.machine_changes.send(json!({ "type": "machines" }).to_string().into());
+            return Err((status, format!("{error}; the new machine is saved as '{temporary}'")));
+        }
+    } else {
+        herdr_cli(&["machine".into(), "rename".into(), id.clone(), "--label".into(), label]).await?;
     }
-    herdr_cli(&["machine".into(), "rename".into(), id.clone(), "--label".into(), label]).await?;
     let _ = state.machine_changes.send(json!({ "type": "machines" }).to_string().into());
     Ok(Json(json!({ "id": id })))
 }
