@@ -307,7 +307,9 @@ impl HerdrClient {
     /// Starts the local headless herdr server if it is not already running, outside the bridge's own
     /// process tree: as its own transient systemd user unit when there is one (a restart of the bridge
     /// kills everything in its cgroup, `setsid` doesn't leave it), else in a session of its own.
-    /// Rate-limited so failure doesn't spawn a storm of processes.
+    /// Rate-limited so failure doesn't spawn a storm of processes. A caller that finds a spawn already
+    /// under way waits for that server's socket too, rather than failing: a client's first requests
+    /// arrive together (snapshot and `/ws/session`), and all of them should see the server it starts.
     async fn try_spawn_server(&self) {
         use std::sync::atomic::{AtomicU64, Ordering};
         static LAST_SPAWN: AtomicU64 = AtomicU64::new(0);
@@ -317,10 +319,10 @@ impl HerdrClient {
             .unwrap_or_default()
             .as_secs();
         let last = LAST_SPAWN.load(Ordering::Relaxed);
-        if now.saturating_sub(last) < 15 {
-            return;
-        }
-        if LAST_SPAWN.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        if now.saturating_sub(last) < 15
+            || LAST_SPAWN.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err()
+        {
+            self.wait_for_socket().await;
             return;
         }
 
@@ -345,20 +347,27 @@ impl HerdrClient {
 
         match started {
             Ok(()) => {
-                // Poll for socket readiness up to 2 seconds
-                for _ in 0..20 {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    if UnixStream::connect(&self.socket_path).await.is_ok() {
-                        info!("Herdr server started and listening at {:?}", self.socket_path);
-                        return;
-                    }
+                if self.wait_for_socket().await {
+                    info!("Herdr server started and listening at {:?}", self.socket_path);
+                } else {
+                    warn!("Spawned `herdr server`, but socket {:?} was not ready in 2 s", self.socket_path);
                 }
-                warn!("Spawned `herdr server`, but socket {:?} was not ready in 2 s", self.socket_path);
             }
             Err(e) => {
                 warn!("Failed to spawn `herdr server`: {e}");
             }
         }
+    }
+
+    /// Whether herdr's socket accepts a connection within 2 s.
+    async fn wait_for_socket(&self) -> bool {
+        for _ in 0..20 {
+            if UnixStream::connect(&self.socket_path).await.is_ok() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
     }
 
     /// Opens a connection to herdr and writes one request to it.
